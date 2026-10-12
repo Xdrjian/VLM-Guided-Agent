@@ -1,0 +1,6 @@
+sequence_name: carry_organizer_with_both_hands_at_chest_height-436
+source: local_download
+short_script: Carry organizer with both hands at chest height
+notes:
+  - Minimal local rendering test for HUMOTO dataset
+  - Generated for local inspection in the VGA repository

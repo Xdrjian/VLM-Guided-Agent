@@ -1,0 +1,9 @@
+source_sequence: carry_organizer_with_both_hands_at_chest_height-436
+selection_rule: first frame where |yaw - mean(yaw[0:15])| > 45 deg; keep frames [0,
+  turn_start-1]
+turn_start_frame: 83
+kept_frame_range:
+- 0
+- 82
+kept_num_frames: 83
+note: Straight-walk pre-turn segment for feasibility experiments.

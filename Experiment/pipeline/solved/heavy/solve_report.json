@@ -1,0 +1,74 @@
+{
+  "params": {
+    "knee_flex_scale": 1.25,
+    "trunk_lean_offset": 8.0,
+    "cadence_scale": 0.9,
+    "double_support_offset": 0.06,
+    "stride_length_scale": 0.8,
+    "elbow_flex_offset": 10.0,
+    "tray_chest_distance_scale": 0.85
+  },
+  "target": {
+    "num_frames": 83,
+    "src_idx_range": "0.0..73.8",
+    "knee_flex_left": "20.4..123.4",
+    "knee_flex_right": "24.0..120.6",
+    "trunk_lean": "15.9..20.5",
+    "elbow_flex_left": "75.4..79.5",
+    "root_travel_m": 1.5723,
+    "tray_chest_distance": 0.3595,
+    "notes": []
+  },
+  "solve": {
+    "elapsed_s": 74.75,
+    "converged": true,
+    "task": "555.39 -> 44.37",
+    "prior": "-0.0000 -> 0.0041",
+    "rom": "0.0000 -> 0.0000",
+    "smooth": "6.89e-05 -> 2.62e-05",
+    "contact": "2.38e-05 -> 9.50e-06",
+    "notes": [
+      "已启用时间映射暖启动",
+      "权重已按初始点自动定标",
+      "增量幅度 {'max_rot_deg': 43.50220489501953, 'mean_rot_deg': 5.548100471496582, 'max_root_shift_m': 0.03639243543148041}"
+    ]
+  },
+  "ref_features": {
+    "num_frames": 83,
+    "duration_s": 3.4583,
+    "cadence_steps_per_s": 1.4118,
+    "cycle_frames": 34.0,
+    "stride_length_m": 0.9216,
+    "double_support_ratio": 0.2651,
+    "knee_flex_left_mean": 52.263,
+    "knee_flex_left_max": 98.825,
+    "knee_flex_right_mean": 51.545,
+    "knee_flex_right_max": 97.011,
+    "trunk_lean_mean": 10.513,
+    "trunk_lean_max": 12.535,
+    "elbow_flex_left_mean": 67.279,
+    "elbow_flex_right_mean": 55.984,
+    "com_vertical_range_m": 0.1012,
+    "tray_chest_distance_mean": 0.423,
+    "phase_valid": true
+  },
+  "new_features": {
+    "num_frames": 83,
+    "duration_s": 3.4583,
+    "cadence_steps_per_s": 1.2632,
+    "cycle_frames": 38.0,
+    "stride_length_m": 0.9224,
+    "double_support_ratio": 0.3253,
+    "knee_flex_left_mean": 59.941,
+    "knee_flex_left_max": 122.741,
+    "knee_flex_right_mean": 60.937,
+    "knee_flex_right_max": 120.478,
+    "trunk_lean_mean": 18.643,
+    "trunk_lean_max": 20.792,
+    "elbow_flex_left_mean": 77.191,
+    "elbow_flex_right_mean": 65.081,
+    "com_vertical_range_m": 0.1296,
+    "tray_chest_distance_mean": 0.3559,
+    "phase_valid": true
+  }
+}

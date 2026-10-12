@@ -1,0 +1,110 @@
+===== SYSTEM =====
+你是一个动作生成流程中的参数决策模块。
+以下提供的历史记录，均为本流程历次决策所采用的参数及其产生的后果；你的职责是基于这些因果记录给出下一轮参数，而不是为任何一次历史决策辩护。
+你只输出一个 JSON 对象，不要输出任何解释性前后文。
+
+===== USER =====
+任务目标：使动作看起来像是端着 30kg 的托盘行走。该目标全程不变。
+当前需要给出第 3 轮的参数。
+
+【可调参数说明】
+- knee_flex_scale：膝屈曲角乘性缩放，>1 屈膝更深；取值范围 [0.5, 2.0]
+- trunk_lean_offset：躯干前倾加性偏置（度），正值更前倾；取值范围 [-15.0, 40.0]
+- cadence_scale：步频乘性缩放，>1 步数更多；取值范围 [0.5, 1.8]
+- double_support_offset：双支撑相占比加性偏置（归一化比例），正值双脚同时着地更久；取值范围 [-0.1, 0.25]
+- stride_length_scale：步长乘性缩放，作用于根节点水平位移；取值范围 [0.4, 1.6]
+- elbow_flex_offset：肘屈曲加性偏置（度），正值肘部更收紧、托盘更贴身；取值范围 [-20.0, 45.0]
+- tray_chest_distance_scale：托盘到胸骨的水平距离乘性缩放，<1 更贴近胸前；取值范围 [0.5, 1.5]
+
+【历史最佳解 — 本轮参数修改的基底】来源：第 1 轮的解
+参数：
+{
+  "knee_flex_scale": 1.25,
+  "trunk_lean_offset": 8.0,
+  "cadence_scale": 0.9,
+  "double_support_offset": 0.05,
+  "stride_length_scale": 0.85,
+  "elbow_flex_offset": 10.0,
+  "tray_chest_distance_scale": 0.9
+}
+VLM 分项评分与评语：
+{
+  "weight": 3,
+  "time": 3,
+  "space": 3,
+  "flow": 3,
+  "naturalness": 8,
+  "comments": {
+    "weight": "能看出负重但幅度不足",
+    "time": "节奏偏慢，方向正确",
+    "space": "步幅收窄合理",
+    "flow": "略显机械",
+    "naturalness": "整体自然，手臂略僵"
+  }
+}
+其生物力学步态特征：
+{
+  "knee_flex_peak_deg": 122.7,
+  "trunk_lean_mean_deg": 18.6,
+  "cadence_steps_per_s": 1.26,
+  "stride_length_m": 0.78
+}
+
+【最近轮次记录 — 仅作为方向参考，不作为本轮修改基底】
+第 2 轮（已回滚）
+采用参数：
+{
+  "knee_flex_scale": 1.8,
+  "trunk_lean_offset": 25.0,
+  "cadence_scale": 0.7,
+  "double_support_offset": 0.15,
+  "stride_length_scale": 0.6,
+  "elbow_flex_offset": 30.0,
+  "tray_chest_distance_scale": 0.7
+}
+VLM 分项评分与评语：
+{
+  "weight": 2,
+  "time": 2,
+  "space": 2,
+  "flow": 2,
+  "naturalness": 4,
+  "comments": {
+    "weight": "夸张到失真",
+    "time": "过慢",
+    "space": "步幅过小",
+    "flow": "断续",
+    "naturalness": "姿态怪异"
+  }
+}
+实际生物力学特征：
+{
+  "knee_flex_peak_deg": 152.1,
+  "trunk_lean_mean_deg": 35.2,
+  "cadence_steps_per_s": 0.98,
+  "stride_length_m": 0.55
+}
+
+【求解器执行反馈】上一轮下达的参数，实际被求解器执行后测得的生物力学特征：
+{
+  "knee_flex_peak_deg": 152.1,
+  "trunk_lean_mean_deg": 35.2,
+  "cadence_steps_per_s": 0.98,
+  "stride_length_m": 0.55
+}
+若某个参数指令与其实际执行效果存在显著背离（例如指定膝屈曲放大而实测曲线几乎未变），请在 reasoning 中明确指出，这可能意味着求解器执行失效而非参数方向错误。
+
+【要求】
+1. 以**历史最佳解**为基底进行修改；被回滚的轮次只用于判断"哪个方向不奏效"，不作为延拓起点。
+2. 输出**完整的一组绝对数值**，而非增量或百分比调整。
+3. 所有数值必须落在上述取值范围内。
+
+请严格以如下 JSON 格式输出（不要添加任何额外文字）：
+{"knee_flex_scale": float,
+ "trunk_lean_offset": float,
+ "cadence_scale": float,
+ "double_support_offset": float,
+ "stride_length_scale": float,
+ "elbow_flex_offset": float,
+ "tray_chest_distance_scale": float,
+ "reasoning": str}
