@@ -389,6 +389,19 @@ def test_solver(seq, skel: Skeleton, feats, curves):
     check("存在真正站定的帧（未打滑）", float(speed.min()) < 0.05,
           f"最小速度 {float(speed.min()):.3f} m/s")
 
+    # --- 设备一致性（CPU 自测无法发现跨设备 bug，故显式检查搬迁契约） --- #
+    check("Skeleton 可搬迁", hasattr(skel, "to") and skel.to("cpu") is skel)
+    check("TargetSpec 可搬迁", hasattr(target, "to") and target.to("cpu") is target)
+    check("ROMPenalty 可搬迁", hasattr(rom, "to") and rom.to("cpu") is rom)
+    if torch.cuda.is_available():
+        res_g = solve(seq, skel, target,
+                      cfg=SolverConfig(adam_iters=20, lbfgs_iters=5,
+                                       device="cuda", log_every=999))
+        check("CUDA 下可求解（skel/target 仍在 CPU）",
+              res_g.pose.is_cuda and skel.device.type == "cpu")
+    else:
+        check("CUDA 不可用，跨设备路径未覆盖（需在 Linux 机复测）", True, "skipped")
+
 
 # --------------------------------------------------------------------------- #
 def main() -> int:
