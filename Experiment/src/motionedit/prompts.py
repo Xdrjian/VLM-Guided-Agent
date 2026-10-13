@@ -24,6 +24,7 @@ __all__ = [
     "VLM_SYSTEM",
     "LLM_SYSTEM",
     "GridSpec",
+    "VideoSpec",
     "render_vlm_prompt",
     "render_vlm_prompt_round0",
     "render_llm_prompt",
@@ -123,6 +124,22 @@ class GridSpec:
         return self.rows * self.cols
 
     @property
+    def items_per_motion(self) -> int:
+        """一个动作需要提交几份素材。"""
+        return len(self.cameras)
+
+    @property
+    def media_noun(self) -> str:
+        return "张宫格图"
+
+    def layout_block(self) -> str:
+        n = len(self.cameras)
+        return (f"- **左列**（前 {n} 张）：当前**历史最佳解**的 {n} 个机位。\n"
+                f"- **右列**（后 {n} 张）：**本轮候选解**的 {n} 个机位。\n"
+                f"- 左右同一行为同一机位，可直接逐帧对比。\n"
+                + self.describe())
+
+    @property
     def grid_px(self) -> tuple:
         return (self.cols * self.cell_px, self.rows * self.cell_px)
 
@@ -137,6 +154,52 @@ class GridSpec:
         return {"rows": self.rows, "cols": self.cols, "cell_px": self.cell_px,
                 "crop_to_subject": self.crop_to_subject, "cameras": list(self.cameras),
                 "grid_px": list(self.grid_px)}
+
+
+class VideoSpec:
+    """视频素材规格。A0 探针实测后取代宫格图成为 VLM 的默认输入形态。
+
+    选视频而非宫格图的决定性证据（2026-10，gemini-3.8-flash 实测）：
+    宫格图按步态相位归一化抽帧，**时间信息被彻底抹掉**，模型无从判断快慢；
+    而同一组动作改用视频后，模型答出"乙比甲快约 2.0 倍"（真值 1.857，误差 7.7%），
+    并明确指出依据是"地面网格上的位移进度"——静止相机 + 棋盘格地面的设计在此兑现。
+    """
+
+    def __init__(self, cameras: Sequence[str] = ("正侧面", "正前方", "45°斜前上方"),
+                 fps: float = 24.0, stacked: bool = True):
+        self.cameras = tuple(cameras)
+        self.fps = float(fps)
+        self.stacked = bool(stacked)
+
+    @property
+    def items_per_motion(self) -> int:
+        return 1 if self.stacked else len(self.cameras)
+
+    @property
+    def media_noun(self) -> str:
+        return "段视频"
+
+    def describe(self) -> str:
+        cams = "、".join(f"{i + 1}={c}" for i, c in enumerate(self.cameras))
+        if self.stacked:
+            return (f"每段视频把 {len(self.cameras)} 个机位**横向拼接**在同一画面中，"
+                    f"从左到右依次为：{cams}。\n"
+                    f"相机固定不动，地面为棋盘格，因此人物相对地面的位移是真实可读的。")
+        return f"每个动作按机位顺序提交 {len(self.cameras)} 段视频：{cams}。"
+
+    def layout_block(self) -> str:
+        n = self.items_per_motion
+        first = "第一段" if n == 1 else f"前 {n} 段"
+        second = "第二段" if n == 1 else f"后 {n} 段"
+        return (f"- **{first}**：当前**历史最佳解**。\n"
+                f"- **{second}**：**本轮候选解**。\n"
+                f"- 两者的**时长可能不同**。这是真实的动作差异（步频不同导致走完同一段"
+                f"动作所需时间不同），**不是渲染错误**，请把它作为判断依据之一。\n"
+                + self.describe())
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"kind": "video", "cameras": list(self.cameras),
+                "fps": self.fps, "stacked": self.stacked}
 
 
 # --------------------------------------------------------------------------- #
@@ -181,27 +244,28 @@ _VLM_OUTPUT_FORMAT = """请严格以如下 JSON 格式输出（不要添加任�
 
 
 def render_vlm_prompt(round_index: int, target_weight_kg: float,
-                      best: Optional[RoundRecord], grid: Optional[GridSpec] = None) -> str:
-    """常规轮次的 VLM prompt（左列=历史最佳解，右列=本轮候选解，同场对比）。
+                      best: Optional[RoundRecord],
+                      grid: Optional[Any] = None) -> str:
+    """常规轮次的 VLM prompt（历史最佳解在前、本轮候选解在后，同场对比）。
+
+    ``grid`` 接受 :class:`GridSpec` 或 :class:`VideoSpec`，二者提供同一套
+    ``items_per_motion`` / ``media_noun`` / ``layout_block`` 接口。
 
     对比锚点固定取**历史最佳解**而非紧邻上一轮：若上一轮是被回滚的失败尝试，
     以它作基准会让 VLM 评语的参照系与 LLM 的实际调参基底错位（workflow.md §4.2）。
     """
-    grid = grid or GridSpec()
-    n_img = 2 * len(grid.cameras)
+    spec = grid or GridSpec()
+    n_items = 2 * spec.items_per_motion
     anchor = ""
     if best is not None:
-        anchor = (f"\n作为对比锚点，左列（历史最佳解）在其对应轮次（第 {best.round_index} 轮）"
+        anchor = (f"\n作为对比锚点，历史最佳解在其对应轮次（第 {best.round_index} 轮）"
                   f"获得的完整评分为：\n{_fmt_score(best.score)}\n"
-                  f"若右列的候选解确实更好，其分数不应低于上述分数；"
+                  f"若本轮候选解确实更好，其分数不应低于上述分数；"
                   f"若更差，请如实给出更低的分数。请避免一律给出中庸评价。\n")
-    return f"""以下是同一个"负重行走"任务的 {n_img} 张渲染宫格图。
+    return f"""以下是同一个"负重行走"任务的 {n_items} {spec.media_noun}。
 
-【图像组织规则】
-- **左列**（前 {len(grid.cameras)} 张）：当前**历史最佳解**的 {len(grid.cameras)} 个机位。
-- **右列**（后 {len(grid.cameras)} 张）：**本轮候选解**的 {len(grid.cameras)} 个机位。
-- 左右同一行为同一机位，可直接逐帧对比。
-{grid.describe()}
+【素材组织规则】
+{spec.layout_block()}
 
 【任务上下文】
 任务目标：使动作看起来像是端着 {target_weight_kg:g}kg 的托盘行走。该目标全程不变。
@@ -215,7 +279,7 @@ def render_vlm_prompt(round_index: int, target_weight_kg: float,
 
 
 def render_vlm_prompt_round0(target_weight_kg: float,
-                             grid: Optional[GridSpec] = None) -> str:
+                             grid: Optional[Any] = None) -> str:
     """第 0 轮专用 prompt（workflow.md §4.4）。
 
     必须明确告知这是未经处理的动捕真值。理由：A_ref 的自然度理应是所有候选中
@@ -223,10 +287,10 @@ def render_vlm_prompt_round0(target_weight_kg: float,
     这构成一次**低成本的 VLM 可靠性验证**。Weight 维度仍需如实评分——
     A_ref 是空载/轻载，其 Weight 分数没有预设的"正确值"，是真正有意义的判断。
     """
-    grid = grid or GridSpec()
-    return f"""以下是 {len(grid.cameras)} 张渲染宫格图，来自**未经任何处理的人体动作捕捉参考数据
+    spec = grid or GridSpec()
+    return f"""以下是 {spec.items_per_motion} {spec.media_noun}，来自**未经任何处理的人体动作捕捉参考数据
 （ground truth，真实人类表演的录制结果）**。
-{grid.describe()}
+{spec.describe()}
 
 【任务上下文】
 后续流程的目标是：使动作看起来像是端着 {target_weight_kg:g}kg 的托盘行走。
