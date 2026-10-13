@@ -45,8 +45,9 @@ from motionedit.rotation import (                                     # noqa: E4
 )
 from motionedit.skeleton import CORE_BONES, Skeleton                  # noqa: E402
 from motionedit.solver import PoseVariable, SolverConfig, solve       # noqa: E402
-from motionedit.targets import build_targets, resample_pose           # noqa: E402
-from motionedit.tray import update_tray_in_sequence, calibrate_tray_config  # noqa: E402
+from motionedit.targets import (build_targets, resample, resample_objects,      # noqa: E402
+                                resample_pose)
+from motionedit.tray import calibrate_grip, update_tray_in_sequence  # noqa: E402
 
 REPO = ROOT.parents[1]
 SKEL_JSON = REPO / "humoto" / "human_model" / "human_model_up_bone_zup.json"
@@ -207,62 +208,59 @@ def test_rom(seq, skel: Skeleton):
 
 
 def test_tray(seq, skel: Skeleton):
-    print("\n[6] tray 位姿更新")
-    out = update_tray_in_sequence(seq, skel, "draw_organizer_tray")
-    tray = out.objects["draw_organizer_tray"]
-    check("托盘轨道形状 [T,7]", tuple(tray.shape) == (seq.num_frames, 7), str(tuple(tray.shape)))
+    print("\n[6] 托盘刚性抓握")
+    TRAY = "draw_organizer_tray"
+    grip = calibrate_grip(seq, skel, TRAY)
+    check("抓握残差极小（双手扣在同一刚体上）", grip.residual_m < 0.005,
+          f"{grip.residual_m * 1000:.2f} mm")
+    check("参考动作托盘近乎水平", grip.tilt_max_deg < 15.0,
+          f"倾角峰值 {grip.tilt_max_deg:.2f}°")
 
-    joints = skel.joint_positions(seq.pose)
-    lh = joints[:, skel.index("mixamorig:LeftHand")]
-    rh = joints[:, skel.index("mixamorig:RightHand")]
-    mid = 0.5 * (lh + rh)
-    d = (tray[:, 4:] - mid).norm(dim=-1).max().item()
-    check("托盘中心贴合双手中点", d < 0.15, f"max_dist={d:.3f}m")
+    out = update_tray_in_sequence(seq, skel, grip)
+    tray = out.objects[TRAY]
+    check("托盘轨道形状 [T,7]", tuple(tray.shape) == (seq.num_frames, 7), str(tuple(tray.shape)))
 
     q = tray[:, :4]
     check("托盘四元数为单位四元数", (q.norm(dim=-1) - 1).abs().max().item() < 1e-5)
 
-    jerk = (tray[2:, 4:] - 2 * tray[1:-1, 4:] + tray[:-2, 4:]).norm(dim=-1).max().item()
-    check("托盘轨迹平滑（无高频抖动）", jerk < 0.05, f"max_accel={jerk:.4f}")
+    # 与原始轨道对比：刚性重建应远小于托盘半厚（启发式方案曾达 24.5 mm）
+    orig = seq.objects[TRAY]
+    pos_err = (tray[:, 4:] - orig[:, 4:]).norm(dim=-1).mean().item()
+    rot_err = (1 - (tray[:, :4] * orig[:, :4]).sum(-1).abs()).mean().item()
+    check("托盘位置重建误差 < 5 mm", pos_err < 0.005, f"{pos_err * 1000:.2f} mm")
+    check("托盘朝向重建误差极小", rot_err < 1e-4, f"1-|dot|={rot_err:.6f}")
 
-    # --- 几何断言（2026-09 新增）---------------------------------------- #
-    # 上面四项断言在"轴约定写反"的情况下**全部都能通过**——位姿数字本身无异常，
-    # 只有把网格变换到世界系才看得出托盘被立成了一块竖直的板。
-    if not seq.object_models or "draw_organizer_tray" not in seq.object_models:
+    # --- 几何断言：位姿数字本身正常也可能把托盘立成一块竖板 --- #
+    if not seq.object_models or TRAY not in seq.object_models:
         check("托盘网格可用（几何断言前置条件）", False,
               "pkl 缺 object_models，请先跑 scripts/fix_tray_mesh.py")
         return
 
-    verts = torch.tensor(np.asarray(seq.object_models["draw_organizer_tray"]["mesh"][0]))
+    verts = torch.tensor(np.asarray(seq.object_models[TRAY]["mesh"][0]))
     ext_local = (verts.max(0).values - verts.min(0).values)
     thin = int(ext_local.argmin())
     check("托盘网格为扁平形状", float(ext_local.min() / ext_local.max()) < 0.3,
-          f"局部尺寸 {[round(float(e),3) for e in ext_local]}")
+          f"局部尺寸 {[round(float(e), 3) for e in ext_local]}")
+    check("标定出的法线轴 = 网格最薄轴", grip.normal_axis == thin,
+          f"normal={grip.normal_axis} thin={thin}")
 
-    def to_world(pose):
-        R = quaternion_to_matrix(pose[:, :4])
-        return torch.einsum("tij,nj->tni", R, verts) + pose[:, None, 4:]
-
-    vw = to_world(tray)
+    R = quaternion_to_matrix(tray[:, :4])
+    vw = torch.einsum("tij,nj->tni", R, verts) + tray[:, None, 4:]
     size_w = (vw[0].max(0).values - vw[0].min(0).values)
     check("托盘在世界系中平放（竖直方向为厚度）",
           float(size_w[2]) < 2.0 * float(ext_local[thin]),
           f"世界竖直尺寸 {float(size_w[2]):.3f}m（网格厚度 {float(ext_local[thin]):.3f}m）")
 
-    # 与原始托盘轨道对比：重建应接近 ground truth
-    orig = seq.objects["draw_organizer_tray"]
-    pos_err = (tray[:, 4:] - orig[:, 4:]).norm(dim=-1).mean().item()
-    rot_err = (1 - (tray[:, :4] * orig[:, :4]).sum(-1).abs()).mean().item()
-    check("托盘位置重建误差小", pos_err < 0.05, f"{pos_err:.4f}m")
-    check("托盘朝向重建误差小", rot_err < 0.05, f"1-|dot|={rot_err:.5f}")
-
-    # 标定器应能从原始数据反推出正确的轴约定
-    cfg, diag = calibrate_tray_config(seq, skel, "draw_organizer_tray")
-    check("标定出的法线轴 = 网格最薄轴", cfg.normal_axis == thin,
-          f"normal={cfg.normal_axis} thin={thin}")
-    check("span 轴标定置信度高", diag["span_confidence"] > 0.9,
-          str(diag["span_confidence"]))
-    check("标定无轴向冲突告警", "warning" not in diag, diag.get("warning", ""))
+    # 双手落在托盘两侧外沿，而不是盘面正中央——这是穿模与否的关键
+    joints = skel.joint_positions(seq.pose)
+    lh = joints[:, skel.index("mixamorig:LeftHand")]
+    rh = joints[:, skel.index("mixamorig:RightHand")]
+    sep = (rh - lh).norm(dim=-1)
+    span = float(ext_local.max())
+    check("双手扣在托盘外沿", float(sep.mean()) > span,
+          f"手距 {float(sep.mean()):.3f}m vs 托盘跨度 {span:.3f}m")
+    check("双手间距恒定（刚体约束）", float(sep.std()) < 0.002,
+          f"标准差 {float(sep.std()) * 1000:.2f} mm")
 
 
 def test_params():
@@ -298,8 +296,13 @@ def test_targets(feats, curves):
     d = t1.src_idx[1:] - t1.src_idx[:-1]
     check("时间映射严格单调（时间不倒流）", bool((d > 0).all()),
           f"步进 {float(d.min()):.3f}..{float(d.max()):.3f}")
-    check("步频降低 → 源索引推进变慢", float(t1.src_idx[-1]) < float(t0.src_idx[-1]),
-          f"{float(t1.src_idx[-1]):.1f} < {float(t0.src_idx[-1]):.1f}")
+    check("步频降低 → 每帧源索引推进变慢", float(d.mean()) < 1.0,
+          f"均步进 {float(d.mean()):.3f}")
+    check("步频降低 → 输出变长（而非截断动作）", t1.num_frames > t0.num_frames,
+          f"{t0.num_frames} 帧 -> {t1.num_frames} 帧")
+    check("参考动作被完整走完", float(t1.src_idx[-1]) >= float(t0.src_idx[-1]) - 1.0,
+          f"源索引末端 {float(t1.src_idx[-1]):.1f} / {float(t0.src_idx[-1]):.1f}")
+    check("尾部无定格帧", not any("越界" in s for s in t1.notes))
     check("屈膝加深", float(t1.knee_flex_left.max()) > float(t0.knee_flex_left.max()) + 10,
           f"{float(t0.knee_flex_left.max()):.1f}° -> {float(t1.knee_flex_left.max()):.1f}°")
     check("躯干更前倾",
@@ -309,10 +312,26 @@ def test_targets(feats, curves):
     trav1 = float((t1.root_world[-1, :2] - t1.root_world[0, :2]).norm())
     check("步长缩短", trav1 < trav0, f"{trav0:.3f}m -> {trav1:.3f}m")
     check("根节点高度不受步长参数影响",
-          float((t1.root_world[:, 2] - t0.root_world[:, 2]).abs().max()) > -1,
+          float((t1.root_world[:, 2]
+                 - resample(curves.root_world, t1.src_idx)[:, 2]).abs().max()) < 1e-5,
           "（垂直分量单独处理）")
-    check("托盘更贴身", t1.tray_chest_distance < t0.tray_chest_distance,
-          f"{t0.tray_chest_distance:.3f}m -> {t1.tray_chest_distance:.3f}m")
+    check("托盘更贴身",
+          t1.tray_chest_distance_mean < t0.tray_chest_distance_mean,
+          f"{t0.tray_chest_distance_mean:.3f}m -> {t1.tray_chest_distance_mean:.3f}m")
+    check("托盘距离目标为逐帧曲线（非标量均值）",
+          t0.tray_chest_distance is not None
+          and t0.tray_chest_distance.shape == (t0.num_frames,)
+          and float(t0.tray_chest_distance.std()) > 1e-4,
+          f"标准差 {float(t0.tray_chest_distance.std()):.4f}m")
+
+    # 快慢两侧必须同标准：都把参考动作走完，只是花的时间不同
+    ref_last = float(curves.knee_flex_left.shape[0] - 1)
+    for cs in (0.5, 0.7, 1.0, 1.3, 1.8):
+        tc = build_targets(curves, GaitParams(cadence_scale=cs).clipped(), ref_d)
+        cov = float(tc.src_idx[-1]) / ref_last
+        check(f"步频 {cs:.1f} 内容覆盖完整且无定格",
+              cov > 0.985 and not any("越界" in s for s in tc.notes),
+              f"{tc.num_frames} 帧，覆盖 {cov * 100:.1f}%")
 
     extreme = GaitParams(double_support_offset=0.25).clipped()
     t2 = build_targets(curves, extreme, ref_d)
@@ -339,11 +358,13 @@ def test_solver(seq, skel: Skeleton, feats, curves):
 
     # 暖启动应当已经完成大部分时间轴对齐工作
     warm = resample_pose(seq.pose, target.src_idx)
+    cold = resample_pose(seq.pose, torch.arange(
+        target.num_frames, dtype=seq.pose.dtype).clamp(max=seq.num_frames - 1.0))
     rom = build_rom_penalty(skel)
-    loss_cold = MotionLoss(skel, seq.pose, target, rom)
+    loss_cold = MotionLoss(skel, cold, target, rom)
     loss_warm = MotionLoss(skel, warm, target, rom)
     with torch.no_grad():
-        task_cold = float(loss_cold(seq.pose, 0.0).task)
+        task_cold = float(loss_cold(cold, 0.0).task)
         task_warm = float(loss_warm(warm, 0.0).task)
     check("暖启动显著降低初始任务项", task_warm < task_cold * 0.6,
           f"{task_cold:.1f} -> {task_warm:.1f}")
@@ -373,7 +394,8 @@ def test_solver(seq, skel: Skeleton, feats, curves):
           f"rom={res.final_terms['rom']:.4f}")
 
     out = MotionSequence(pose=res.pose, bone_names=seq.bone_names,
-                         objects=seq.objects, fps=seq.fps)
+                         objects=resample_objects(seq.objects, target.src_idx),
+                         fps=seq.fps, object_models=seq.object_models)
     f2, _ = extract_features(out, skel, tray_name="draw_organizer_tray")
     check("屈膝确实加深", f2.knee_flex_left_max > feats.knee_flex_left_max + 10,
           f"{feats.knee_flex_left_max:.1f}° -> {f2.knee_flex_left_max:.1f}°")
@@ -388,6 +410,47 @@ def test_solver(seq, skel: Skeleton, feats, curves):
     speed = (toe[1:, :2] - toe[:-1, :2]).norm(dim=-1) * seq.fps
     check("存在真正站定的帧（未打滑）", float(speed.min()) < 0.05,
           f"最小速度 {float(speed.min()):.3f} m/s")
+
+    # --- 恒等参数自洽性：目标就是 A_ref 本身，解也应当是 A_ref --- #
+    # 这一条此前只在"目标层"验过、没在"求解器层"验过，于是 tray 任务项用标量均值
+    # 去压真实波动的 bug 活了很久：恒等参数下它仍产生 3.92 的伪压力，
+    # 求解器用肩关节 24.6° 的旋转去抹平，把双手从 0.579m 挤到 0.31m。
+    grip_ref = calibrate_grip(seq, skel, "draw_organizer_tray")
+    t_id = build_targets(curves, GaitParams(), ref_d)
+    res_id = solve(seq, skel, t_id, grip=grip_ref,
+                   cfg=SolverConfig(adam_iters=120, lbfgs_iters=20, log_every=999))
+    check("恒等参数下任务项本就接近 0", res_id.initial_terms["task"] < 1.0,
+          f"初始 task={res_id.initial_terms['task']:.3f}")
+
+    def hand_sep(pose):
+        j = skel.joint_positions(pose)
+        return (j[:, skel.index("mixamorig:RightHand")]
+                - j[:, skel.index("mixamorig:LeftHand")]).norm(dim=-1)
+
+    sep0, sep1 = hand_sep(seq.pose), hand_sep(res_id.pose.cpu())
+    check("恒等参数下双手间距不塌缩",
+          abs(float(sep1.mean() - sep0.mean())) < 0.005,
+          f"{float(sep0.mean()):.4f}m -> {float(sep1.mean()):.4f}m")
+    check("恒等参数下抓握不脱手", res_id.final_terms["grip"] < 1.0,
+          f"grip={res_id.final_terms['grip']:.4f}")
+    check("恒等参数下托盘不倾倒", res_id.final_terms["level"] < 1.0,
+          f"level={res_id.final_terms['level']:.4f}")
+
+    q_a, q_b = seq.pose[:, :, :4], res_id.pose.cpu()[:, :, :4]
+    dev_deg = 2 * torch.rad2deg(torch.acos((q_a * q_b).sum(-1).abs().clamp(max=1.0)))
+    # 用逐骨骼**均值**而非全局最大值：足尖在未接触帧处于损失零空间，会游走
+    # 十几度而不影响视觉；当初那个肩部塔缩 bug 的均值是 24.58°，本判据能抓住
+    check("恒等参数下各骨骼均未显著偏离 A_ref",
+          float(dev_deg.mean(0).max()) < 3.0,
+          f"最大逐骨骼均值 {float(dev_deg.mean(0).max()):.2f}°")
+    check("恒等参数下总损失近乎为零", res_id.final_terms["total"] < 1.0,
+          f"total={res_id.final_terms['total']:.4f}")
+
+    # --- 非恒等参数下托盘仍须守住 --- #
+    check("heavy 参数下抓握仍不脱手", res.final_terms["grip"] < 5.0,
+          f"grip={res.final_terms['grip']:.4f}")
+    check("heavy 参数下托盘仍大致水平", res.final_terms["level"] < 25.0,
+          f"level={res.final_terms['level']:.4f} deg²")
 
     # --- 设备一致性（CPU 自测无法发现跨设备 bug，故显式检查搬迁契约） --- #
     check("Skeleton 可搬迁", hasattr(skel, "to") and skel.to("cpu") is skel)
