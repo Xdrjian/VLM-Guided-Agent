@@ -304,11 +304,176 @@ def probe_cleanup() -> Dict[str, Any]:
     return info
 
 
+# ------------------------- 第二批：第一批结果暴露出来的新未知 ------------- #
+@probe("gc_body", "⑨ generate_content 的完整响应体（适配层实际要走这条路）")
+def probe_gc_body(video_a: Path, model: str) -> Dict[str, Any]:
+    """第一批已证实：``interactions.create`` **无法设温度/seed**，只能用
+    ``models.generate_content``。但当时只看了它的文本输出，没看响应体结构，
+    而 ``RawResponse`` 要记录 model 回显 / usage / finish_reason。"""
+    from google import genai
+    from google.genai import types
+    client = genai.Client()
+    f = _upload(client, video_a)
+    resp = client.models.generate_content(
+        model=model,
+        contents=[types.Part.from_uri(file_uri=f.uri, mime_type=f.mime_type),
+                  '只输出一个 JSON：{"action": str, "confidence": int}'],
+        config=types.GenerateContentConfig(
+            temperature=0.0, seed=0, max_output_tokens=512,
+            response_mime_type="application/json",
+            system_instruction="你是一个只输出 JSON 的评估模块。"),
+    )
+    print("--- text ---")
+    print(getattr(resp, "text", "<无 text 属性>"))
+    body = describe(resp, max_depth=6)
+    print("\n--- 响应体结构 ---")
+    print(json.dumps(body, ensure_ascii=False, indent=2, default=str)[:6000])
+    print("\n>>> 重点：model_version / usage_metadata 字段名 / candidates[0].finish_reason <<<")
+    return {"text": getattr(resp, "text", None), "body": body}
+
+
+@probe("sampling", "⑩ 视频采样率：5 秒视频仅 ~270 input tokens，模型到底看到几帧？")
+def probe_sampling(video_a: Path, model: str) -> Dict[str, Any]:
+    """第一批实测：5s 视频仅 297 input tokens，暗示采样率可能低到 ~1fps。
+    若属实，118 帧的动作只有 5 帧被看到，还不如宫格图的 8 帧——
+    这会动摇"视频信息量更大"这一前提。逐个试探可否调高采样率。"""
+    from google import genai
+    from google.genai import types
+    client = genai.Client()
+    f = _upload(client, video_a)
+    q = "这段视频里人物指到了几次地？请数出左脚触地的次数，并给出每次的大致时间。"
+
+    def run(label: str, part, cfg):
+        r = client.models.generate_content(model=model, contents=[part, q], config=cfg)
+        u = describe(getattr(r, "usage_metadata", None), max_depth=3)
+        print(f"  [{label}] tokens={json.dumps(u, ensure_ascii=False, default=str)}")
+        print(f"           {(getattr(r, 'text', '') or '')[:200]}")
+        return {"usage": u, "text": getattr(r, "text", None)}
+
+    out = {}
+    base = types.Part.from_uri(file_uri=f.uri, mime_type=f.mime_type)
+    for label, maker in [
+        ("默认", lambda: (base, types.GenerateContentConfig(temperature=0.0))),
+        ("media_resolution=HIGH", lambda: (
+            base, types.GenerateContentConfig(
+                temperature=0.0,
+                media_resolution=types.MediaResolution.MEDIA_RESOLUTION_HIGH))),
+        ("video_metadata fps=8", lambda: (
+            types.Part.from_uri(file_uri=f.uri, mime_type=f.mime_type,
+                                video_metadata=types.VideoMetadata(fps=8.0)),
+            types.GenerateContentConfig(temperature=0.0))),
+        ("video_metadata fps=24", lambda: (
+            types.Part.from_uri(file_uri=f.uri, mime_type=f.mime_type,
+                                video_metadata=types.VideoMetadata(fps=24.0)),
+            types.GenerateContentConfig(temperature=0.0))),
+    ]:
+        try:
+            part, cfg = maker()
+            out[label] = run(label, part, cfg)
+        except Exception as e:                          # noqa: BLE001
+            out[label] = {"error": f"{type(e).__name__}: {e}"}
+            print(f"  [{label}] FAIL {type(e).__name__}: {e}")
+    print("\n>>> 重点：input tokens 是否随 fps 上升；数脚步是否变准 <<<")
+    return out
+
+
+@probe("knee", "⑪ 膝角相对分辨（核心参数 knee_flex_scale 能否被看见）")
+def probe_knee(base_v: Path, deep_v: Path, model: str, label: str) -> Dict[str, Any]:
+    """第一批已显示：模型**绝对**膝角估计大错（说 30~40°，实测峰值 98.8°）。
+    但我们并不需要绝对值——只需要它能**分辨两个候选谁屈膝更深**。
+    这才是闭环能否被驱动的真正前提。"""
+    from google import genai
+    from google.genai import types
+    client = genai.Client()
+    fa, fb = _upload(client, base_v), _upload(client, deep_v)
+    prompt = (
+        "以下按顺序提供两段渲染视频，第一段记为【甲】，第二段记为【乙】。\n"
+        "两段动作的唯一区别在于膝关节的弯曲程度。请只回答三个问题：\n"
+        "1. 哪一段的屈膝更深？\n"
+        "2. 两者的膝关节屈曲峰值大约相差多少度？给出一个数字。\n"
+        "3. 你是从哪个机位、哪个时刻看出来的？若无法分辨请直接说无法分辨。"
+    )
+    resp = client.models.generate_content(
+        model=model,
+        contents=[types.Part.from_uri(file_uri=fa.uri, mime_type=fa.mime_type),
+                  types.Part.from_uri(file_uri=fb.uri, mime_type=fb.mime_type),
+                  prompt],
+        config=types.GenerateContentConfig(temperature=0.0, seed=0),
+    )
+    text = getattr(resp, "text", "") or ""
+    print(f"  [{label}]")
+    print(text)
+    print("\n>>> 甲=基准，乙=屈膝更深。模型必须答【乙】 <<<")
+    return {"label": label, "output_text": text}
+
+
+@probe("noise", "⑫ 正式 VLM prompt：JSON 合规性 + 三次重复的打分噪声")
+def probe_noise(video_a: Path, video_b: Path, model: str,
+                repeats: int = 3) -> Dict[str, Any]:
+    """用**流程里真正会用的那份 prompt**跑，而非另写一份——否则摸到的噪声
+    不是实验里的噪声。结果直接决定 `vlm_repeats` / `improvement_margin` / `patience`。"""
+    import sys as _sys
+    _sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from motionedit.prompts import VideoSpec, VLM_SYSTEM, render_vlm_prompt, extract_json
+    from motionedit.records import SCORE_RANGES
+
+    from google import genai
+    from google.genai import types
+    client = genai.Client()
+    fa, fb = _upload(client, video_a), _upload(client, video_b)
+    prompt = render_vlm_prompt(1, 30.0, None, VideoSpec())
+    print(f"  prompt 长度 {len(prompt)} 字符")
+
+    rows: List[Dict[str, Any]] = []
+    for k in range(repeats):
+        try:
+            resp = client.models.generate_content(
+                model=model,
+                contents=[types.Part.from_uri(file_uri=fa.uri, mime_type=fa.mime_type),
+                          types.Part.from_uri(file_uri=fb.uri, mime_type=fb.mime_type),
+                          prompt],
+                config=types.GenerateContentConfig(
+                    temperature=0.0, seed=k, max_output_tokens=2048,
+                    response_mime_type="application/json",
+                    system_instruction=VLM_SYSTEM),
+            )
+            text = getattr(resp, "text", "") or ""
+            data = extract_json(text)
+            bad = [f"{k2}={data.get(k2)}" for k2, (lo, hi) in SCORE_RANGES.items()
+                   if not isinstance(data.get(k2), int) or not lo <= data[k2] <= hi]
+            rows.append({"seed": k, "parsed": True, "scores":
+                         {k2: data.get(k2) for k2 in SCORE_RANGES},
+                         "out_of_range": bad,
+                         "has_comments": isinstance(data.get("comments"), dict),
+                         "usage": describe(getattr(resp, "usage_metadata", None), max_depth=3),
+                         "comments": data.get("comments")})
+            print(f"  第{k + 1}次  {rows[-1]['scores']}  越界={bad or '无'}")
+        except Exception as e:                          # noqa: BLE001
+            rows.append({"seed": k, "parsed": False, "error": f"{type(e).__name__}: {e}"})
+            print(f"  第{k + 1}次  FAIL {type(e).__name__}: {e}")
+
+    ok = [r for r in rows if r.get("parsed")]
+    spread = {}
+    for dim in SCORE_RANGES:
+        vals = [r["scores"][dim] for r in ok
+                if isinstance(r["scores"].get(dim), int)]
+        spread[dim] = (max(vals) - min(vals)) if len(vals) > 1 else None
+    print(f"\n  各维度极差：{spread}")
+    print("  >>> 全部 ≤1 → vlm_repeats=1；任一 ≥2 → 必须 vlm_repeats=3 取中位数 <<<")
+    return {"rows": rows, "spread": spread}
+
+
 # --------------------------------------------------------------------------- #
 def main() -> int:
     ap = argparse.ArgumentParser(description="Gemini API 能力探针（仅限 Linux 机）")
     ap.add_argument("--video-a", type=Path, required=True, help="较慢的那段")
     ap.add_argument("--video-b", type=Path, default=None, help="较快的那段")
+    ap.add_argument("--knee-base", type=Path, default=None,
+                    help="⑪ 用：knee_flex_scale=1.0 的视频")
+    ap.add_argument("--knee-mid", type=Path, default=None,
+                    help="⑪ 用：knee_flex_scale=1.25（现实难度）")
+    ap.add_argument("--knee-deep", type=Path, default=None,
+                    help="⑪ 用：knee_flex_scale=1.6（简单难度，用于定位失败原因）")
     ap.add_argument("--model", default="gemini-3.8-flash")
     ap.add_argument("--out", type=Path, default=Path("probe_gemini_result.json"))
     ap.add_argument("--only", default=None,
@@ -339,6 +504,24 @@ def main() -> int:
         probe_aspect(args.video_a, args.model)
     if want(8):
         probe_cleanup()
+    if want(9):
+        probe_gc_body(args.video_a, args.model)
+    if want(10):
+        probe_sampling(args.video_a, args.model)
+    if want(11):
+        if args.knee_base and args.knee_mid:
+            probe_knee(args.knee_base, args.knee_mid, args.model, "现实难度 1.00 vs 1.25")
+        else:
+            print("\n[跳过 ⑪-a] 未提供 --knee-base / --knee-mid")
+        if args.knee_base and args.knee_deep:
+            probe_knee(args.knee_base, args.knee_deep, args.model, "简单难度 1.00 vs 1.60")
+        else:
+            print("[跳过 ⑪-b] 未提供 --knee-deep")
+    if want(12):
+        if args.video_b:
+            probe_noise(args.video_a, args.video_b, args.model)
+        else:
+            print("\n[跳过 ⑫] 未提供 --video-b")
 
     args.out.write_text(json.dumps(RESULTS, ensure_ascii=False, indent=2, default=str),
                         encoding="utf-8")
