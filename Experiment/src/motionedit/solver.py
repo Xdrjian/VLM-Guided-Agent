@@ -43,6 +43,7 @@ from .rom import ROMPenalty, build_rom_penalty
 from .rotation import quaternion_multiply, rotvec_to_quaternion
 from .skeleton import Skeleton
 from .targets import TargetSpec, resample_pose
+from .tray import GripCalibration, calibrate_grip
 
 __all__ = ["SolverConfig", "SolveResult", "PoseVariable", "solve"]
 
@@ -178,6 +179,7 @@ def solve(
     cfg: Optional[SolverConfig] = None,
     rom: Optional[ROMPenalty] = None,
     callback: Optional[Callable[[int, Dict[str, float]], None]] = None,
+    grip: Optional[GripCalibration] = None,
 ) -> SolveResult:
     """对一段参考动作求解满足 ``target`` 的新动作。
 
@@ -207,16 +209,29 @@ def solve(
     ref_pose = seq.pose.to(dev)
     rom = (rom or build_rom_penalty(skel)).to(dev)
 
+    # 抓握标定只能来自**带真实托盘轨道的参考动作**；没有托盘时两项约束自动关闭
+    if grip is None and seq.objects:
+        try:
+            grip = calibrate_grip(seq, skel)
+            notes.append(f"抓握标定：残差 {grip.residual_m * 1000:.2f} mm，"
+                         f"参考倾角峰值 {grip.tilt_max_deg:.2f}°")
+        except ValueError as e:
+            notes.append(f"抓握标定失败，托盘约束已禁用：{e}")
+            grip = None
+
     # 暖启动：先把参考动作按时间映射整体拉伸/压缩到新时间轴，
     # 剩下的残差才交给优化器。同时用它作为姿势先验的锚点——否则先验会要求
     # "保持原时间轴上的姿势"，与任务项的时间平移要求直接对抗。
-    anchor = resample_pose(ref_pose, target.src_idx) if cfg.warm_start else ref_pose
+    anchor = resample_pose(ref_pose, target.src_idx) if cfg.warm_start else \
+        resample_pose(ref_pose, torch.arange(
+            target.num_frames, device=dev, dtype=ref_pose.dtype
+        ).clamp(max=ref_pose.shape[0] - 1.0))
     if cfg.warm_start:
         notes.append("已启用时间映射暖启动")
 
     var = PoseVariable(anchor, skel.dof_mask().to(dev), skel.index("mixamorig:Hips")).to(dev)
     loss_fn = MotionLoss(skel, anchor, target, rom, weights,
-                         fps=seq.fps, contact_cfg=cfg.contact_cfg)
+                         fps=seq.fps, contact_cfg=cfg.contact_cfg, grip=grip)
 
     # 初始点自动定标（仅当调用方未显式给权重时）
     if weights is None:
