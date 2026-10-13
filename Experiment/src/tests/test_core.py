@@ -456,12 +456,21 @@ def test_solver(seq, skel: Skeleton, feats, curves):
     check("Skeleton 可搬迁", hasattr(skel, "to") and skel.to("cpu") is skel)
     check("TargetSpec 可搬迁", hasattr(target, "to") and target.to("cpu") is target)
     check("ROMPenalty 可搬迁", hasattr(rom, "to") and rom.to("cpu") is rom)
+    check("GripCalibration 可搬迁",
+          hasattr(grip_ref, "to") and grip_ref.to("cpu") is grip_ref)
     if torch.cuda.is_available():
-        res_g = solve(seq, skel, target,
-                      cfg=SolverConfig(adam_iters=20, lbfgs_iters=5,
-                                       device="cuda", log_every=999))
-        check("CUDA 下可求解（skel/target 仍在 CPU）",
+        cuda_cfg = SolverConfig(adam_iters=20, lbfgs_iters=5,
+                                device="cuda", log_every=999)
+        # 两条分支都要覆盖：自动标定（solve 内部）与显式传入（run_solve.py 走这条）
+        res_g = solve(seq, skel, target, cfg=cuda_cfg)
+        check("CUDA 下可求解 · 自动标定抓握",
               res_g.pose.is_cuda and skel.device.type == "cpu")
+        res_g2 = solve(seq, skel, target, cfg=cuda_cfg, grip=grip_ref)
+        check("CUDA 下可求解 · 显式传入 CPU 抓握标定",
+              res_g2.pose.is_cuda and grip_ref.offsets.device.type == "cpu")
+        check("CUDA 与 CPU 的托盘约束数值一致",
+              abs(res_g.final_terms["grip"] - res_g2.final_terms["grip"]) < 1e-3,
+              f"{res_g.final_terms['grip']:.5f} vs {res_g2.final_terms['grip']:.5f}")
     else:
         check("CUDA 不可用，跨设备路径未覆盖（需在 Linux 机复测）", True, "skipped")
 
