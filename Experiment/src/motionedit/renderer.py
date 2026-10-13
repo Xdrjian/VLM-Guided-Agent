@@ -124,6 +124,8 @@ class RenderConfig:
     video_stride: int = 1
     write_video: bool = True
     write_gif: bool = False
+    #: GIF 横向最大宽度（三机位拼接后的总宽）
+    gif_max_width: int = 1920
     human_color: Tuple[float, float, float] = (144 / 255, 210 / 255, 236 / 255)
     tray_color: Tuple[float, float, float] = (0.85, 0.62, 0.32)
     contact: ContactConfig = field(default_factory=ContactConfig)
@@ -366,7 +368,8 @@ class MotionRenderer:
             fps = seq.fps / max(1, self.cfg.video_stride)
             video = montage.write_video(merged, out_dir / f"{tag}_video.mp4", fps=fps)
             if self.cfg.write_gif:
-                gif = montage.write_gif(merged, out_dir / f"{tag}_video.gif", fps=min(fps, 12))
+                gif = montage.write_gif(merged, out_dir / f"{tag}_video.gif", fps=fps,
+                                        max_width=self.cfg.gif_max_width)
             meta["video_frames"] = len(vf)
 
         return RenderOutput(grids=grids, video=video, gif=gif, meta=meta)
