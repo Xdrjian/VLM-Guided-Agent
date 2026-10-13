@@ -40,18 +40,23 @@ def section(title: str) -> None:
 
 
 def probe(key: str, title: str):
-    """装饰器：运行一个探针并把结果/异常收进 RESULTS。"""
+    """装饰器：运行一个探针并把结果/异常收进 RESULTS。
+
+    ``key`` 可被调用方通过关键字参数 ``key=`` 覆盖——同一探针跑多次时
+    若不区分键，后一次会静默覆盖前一次的结果（第二批已踩过这个坑）。
+    """
     def deco(fn):
         def wrapper(*a, **kw):
+            k = kw.pop("key", key) if "key" in kw else key
             section(title)
             try:
                 out = fn(*a, **kw)
-                RESULTS[key] = {"ok": True, "result": out}
+                RESULTS[k] = {"ok": True, "result": out}
                 return out
             except Exception as e:                      # noqa: BLE001
                 print(f"[FAIL] {type(e).__name__}: {e}")
                 traceback.print_exc()
-                RESULTS[key] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+                RESULTS[k] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
                 return None
         return wrapper
     return deco
@@ -284,6 +289,85 @@ def probe_aspect(video_a: Path, model: str) -> Dict[str, Any]:
     return {"output_text": text}
 
 
+def _video_part(types, f, fps: Optional[float] = None):
+    """构造视频 Part。``fps`` 非空时附带采样率。
+
+    不能用 ``Part.from_uri(video_metadata=...)``——该 classmethod 不收这个参数
+    （SDK 2.30.1 实测 TypeError）；但 ``Part`` 本身有 ``video_metadata`` 字段，
+    故直接构造。默认采样率为 1fps，5 秒视频只有约 5 帧，膝屈曲峰值会被整帧跳过。
+    """
+    fd = types.FileData(file_uri=f.uri, mime_type=f.mime_type)
+    if fps is None:
+        return types.Part(file_data=fd)
+    return types.Part(file_data=fd, video_metadata=types.VideoMetadata(fps=float(fps)))
+
+
+@probe("fps_control", "⑬ 采样率 × 温度：哪种写法能同时拿到这两样")
+def probe_fps_control(video_a: Path, model: str, fps: float = 12.0) -> Dict[str, Any]:
+    """第一批证实 ``interactions`` 设不了温度，第二批证实默认采样率是 1fps。
+    二者必须同时满足，否则要么看不见膝角、要么实验不可复现。本探针找出交集。
+
+    客观验证手段：对比 ``prompt_tokens_details`` 里 VIDEO 的 token 数——
+    若采样率真的生效，5 秒视频的 VIDEO token 应从约 285 升到数千量级。
+    """
+    from google import genai
+    from google.genai import types
+    client = genai.Client()
+    f = _upload(client, video_a)
+    q = "这段视频里人物左脚触地几次？请数出次数并给出每次的大致时间。"
+
+    def show(label: str, resp, kind: str) -> Dict[str, Any]:
+        if kind == "gc":
+            text = getattr(resp, "text", "") or ""
+            u = describe(getattr(resp, "usage_metadata", None), max_depth=4)
+            vid = None
+            for d in (u.get("prompt_tokens_details") or []):
+                if str(d.get("modality", "")).upper().endswith("VIDEO"):
+                    vid = d.get("token_count")
+        else:
+            text = getattr(resp, "output_text", "") or ""
+            u = describe(getattr(resp, "usage", None), max_depth=4)
+            vid = u.get("total_input_tokens")
+        print(f"  [OK]   {label}")
+        print(f"         VIDEO tokens = {vid}（1fps 基线约 285）")
+        print(f"         {text[:160]}")
+        return {"ok": True, "video_tokens": vid, "text": text, "usage": u}
+
+    out: Dict[str, Any] = {}
+    trials = [
+        ("A. generate_content + Part(video_metadata=fps) + temperature", "gc",
+         lambda: client.models.generate_content(
+             model=model, contents=[_video_part(types, f, fps), q],
+             config=types.GenerateContentConfig(temperature=0.0, seed=0))),
+        ("B. generate_content 不设 fps（对照基线）", "gc",
+         lambda: client.models.generate_content(
+             model=model, contents=[_video_part(types, f, None), q],
+             config=types.GenerateContentConfig(temperature=0.0, seed=0))),
+        ("C. interactions + processing.fps（无温度）", "it",
+         lambda: client.interactions.create(
+             model=model, input=[
+                 {"type": "video", "uri": f.uri, "mime_type": f.mime_type,
+                  "processing": {"type": "static", "fps": fps}},
+                 {"type": "text", "text": q}])),
+        ("D. interactions + processing.fps + extra_body 温度", "it",
+         lambda: client.interactions.create(
+             model=model, input=[
+                 {"type": "video", "uri": f.uri, "mime_type": f.mime_type,
+                  "processing": {"type": "static", "fps": fps}},
+                 {"type": "text", "text": q}],
+             extra_body={"generation_config": {"temperature": 0.0, "seed": 0}})),
+    ]
+    for label, kind, fn in trials:
+        try:
+            out[label] = show(label, fn(), kind)
+        except Exception as e:                          # noqa: BLE001
+            out[label] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+            print(f"  [FAIL] {label}: {type(e).__name__}: {e}")
+    print("\n>>> 优先采用 A；A 不行再看 D；两者都不行则必须在"
+          "可复现性与可见性之间做取舍 <<<")
+    return out
+
+
 @probe("cleanup", "⑧ 文件清理：能否主动删除（证据包不应依赖云端留存）")
 def probe_cleanup() -> Dict[str, Any]:
     from google import genai
@@ -378,10 +462,14 @@ def probe_sampling(video_a: Path, model: str) -> Dict[str, Any]:
 
 
 @probe("knee", "⑪ 膝角相对分辨（核心参数 knee_flex_scale 能否被看见）")
-def probe_knee(base_v: Path, deep_v: Path, model: str, label: str) -> Dict[str, Any]:
+def probe_knee(base_v: Path, deep_v: Path, model: str, label: str,
+               key: str = "knee", fps: Optional[float] = None) -> Dict[str, Any]:
     """第一批已显示：模型**绝对**膝角估计大错（说 30~40°，实测峰值 98.8°）。
     但我们并不需要绝对值——只需要它能**分辨两个候选谁屈膝更深**。
-    这才是闭环能否被驱动的真正前提。"""
+    这才是闭环能否被驱动的真正前提。
+
+    第二批实测：1 fps 下模型把方向答反了（答【甲】、真值【乙】）。
+    传入 ``fps`` 可复测提高采样率后是否修复。"""
     from google import genai
     from google.genai import types
     client = genai.Client()
@@ -395,16 +483,16 @@ def probe_knee(base_v: Path, deep_v: Path, model: str, label: str) -> Dict[str, 
     )
     resp = client.models.generate_content(
         model=model,
-        contents=[types.Part.from_uri(file_uri=fa.uri, mime_type=fa.mime_type),
-                  types.Part.from_uri(file_uri=fb.uri, mime_type=fb.mime_type),
-                  prompt],
+        contents=[_video_part(types, fa, fps), _video_part(types, fb, fps), prompt],
         config=types.GenerateContentConfig(temperature=0.0, seed=0),
     )
     text = getattr(resp, "text", "") or ""
-    print(f"  [{label}]")
+    u = describe(getattr(resp, "usage_metadata", None), max_depth=4)
+    print(f"  [{label}]  fps={fps or '默认(1)'}")
     print(text)
-    print("\n>>> 甲=基准，乙=屈膝更深。模型必须答【乙】 <<<")
-    return {"label": label, "output_text": text}
+    print(f"\n  tokens: {json.dumps(u.get('prompt_tokens_details'), ensure_ascii=False, default=str)}")
+    print("  >>> 甲=基准，乙=屈膝更深。模型必须答【乙】 <<<")
+    return {"label": label, "fps": fps, "output_text": text, "usage": u}
 
 
 @probe("noise", "⑫ 正式 VLM prompt：JSON 合规性 + 三次重复的打分噪声")
@@ -475,6 +563,8 @@ def main() -> int:
     ap.add_argument("--knee-deep", type=Path, default=None,
                     help="⑪ 用：knee_flex_scale=1.6（简单难度，用于定位失败原因）")
     ap.add_argument("--model", default="gemini-3.8-flash")
+    ap.add_argument("--fps", type=float, default=12.0,
+                    help="⑬⑭ 用的视频采样率（默认值来自网页端实测表现良好的 12）")
     ap.add_argument("--out", type=Path, default=Path("probe_gemini_result.json"))
     ap.add_argument("--only", default=None,
                     help="只跑指定编号，逗号分隔，如 1,2,4")
@@ -510,11 +600,13 @@ def main() -> int:
         probe_sampling(args.video_a, args.model)
     if want(11):
         if args.knee_base and args.knee_mid:
-            probe_knee(args.knee_base, args.knee_mid, args.model, "现实难度 1.00 vs 1.25")
+            probe_knee(args.knee_base, args.knee_mid, args.model,
+                       "现实难度 1.00 vs 1.25", key="knee_mid_1fps")
         else:
             print("\n[跳过 ⑪-a] 未提供 --knee-base / --knee-mid")
         if args.knee_base and args.knee_deep:
-            probe_knee(args.knee_base, args.knee_deep, args.model, "简单难度 1.00 vs 1.60")
+            probe_knee(args.knee_base, args.knee_deep, args.model,
+                       "简单难度 1.00 vs 1.60", key="knee_deep_1fps")
         else:
             print("[跳过 ⑪-b] 未提供 --knee-deep")
     if want(12):
@@ -522,6 +614,20 @@ def main() -> int:
             probe_noise(args.video_a, args.video_b, args.model)
         else:
             print("\n[跳过 ⑫] 未提供 --video-b")
+    if want(13):
+        probe_fps_control(args.video_a, args.model, args.fps)
+    if want(14):
+        # 提高采样率后复测膝角分辨——这是 1fps 失败的直接对照组
+        if args.knee_base and args.knee_deep:
+            probe_knee(args.knee_base, args.knee_deep, args.model,
+                       f"简单难度 1.00 vs 1.60 @ {args.fps}fps",
+                       key=f"knee_deep_{args.fps:g}fps", fps=args.fps)
+        if args.knee_base and args.knee_mid:
+            probe_knee(args.knee_base, args.knee_mid, args.model,
+                       f"现实难度 1.00 vs 1.25 @ {args.fps}fps",
+                       key=f"knee_mid_{args.fps:g}fps", fps=args.fps)
+        if not args.knee_base:
+            print("\n[跳过 ⑳] 未提供膝角素材")
 
     args.out.write_text(json.dumps(RESULTS, ensure_ascii=False, indent=2, default=str),
                         encoding="utf-8")
