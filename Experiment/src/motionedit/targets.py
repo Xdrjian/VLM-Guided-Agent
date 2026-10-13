@@ -26,8 +26,9 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
-from typing import List
+from typing import Dict, List, Optional
 
 import torch
 from torch import Tensor
@@ -35,9 +36,24 @@ from torch import Tensor
 from .features import FeatureCurves
 from .params import GaitParams
 
-__all__ = ["TargetSpec", "build_targets", "resample", "resample_pose", "build_time_map"]
+__all__ = ["TargetSpec", "build_targets", "resample", "resample_pose",
+           "build_time_map", "auto_num_frames", "resample_objects"]
 
 _TWO_PI = 2.0 * torch.pi
+
+
+# --------------------------------------------------------------------------- #
+def auto_num_frames(ref_n: int, cadence_scale: float) -> int:
+    """按步频缩放推导输出帧数，使参考动作被**完整走完**。
+
+    固定输出帧数是错的：``cadence_scale<1`` 时参考动作会被静默截断（只走完
+    前 70%），``>1`` 时源索引越界导致尾部定格——快慢两侧双重标准。
+    按本函数取帧数后，源索引末端恰好落在参考末帧，两种病态同时消失。
+    用 floor 而非 round 是为了保证永不越界。
+    """
+    if ref_n <= 1:
+        return int(ref_n)
+    return int(math.floor((ref_n - 1) / max(float(cadence_scale), 1e-6))) + 1
 
 
 # --------------------------------------------------------------------------- #
@@ -94,17 +110,30 @@ def resample_pose(pose: Tensor, src_idx: Tensor) -> Tensor:
     return torch.cat([q, t], dim=-1)
 
 
+def resample_objects(objects: Dict[str, Tensor], src_idx: Tensor) -> Dict[str, Tensor]:
+    """把物体世界位姿轨迹 ``[T,7]`` 按同一条时间映射重采样。
+
+    物体与人体共享同一条时间轴；输出帧数随步频变化后若不同步重采样，
+    物体轨迹会与姿态错位甚至长度不匹配。
+    """
+    return {k: resample_pose(v.unsqueeze(1), src_idx).squeeze(1)
+            for k, v in objects.items()}
+
+
 def build_time_map(    num_frames: int,
     cycle_frames: float,
     cadence_scale: float,
     double_support_offset: float,
     device: torch.device | str = "cpu",
     dtype: torch.dtype = torch.float32,
+    ref_frames: int | None = None,
 ) -> tuple[Tensor, List[str]]:
-    """构造时间映射曲线 ``src[t]``（目标第 t 帧 → 参考第 src[t] 帧）。
+    """构造时间映射曲线 ``src[t]``（目标第 t 帧 → 参考第 ``src[t]`` 帧）。
 
-    - ``cadence_scale`` > 1：步频加快，同样帧数内走完更多参考帧（源索引推进更快）
+    - ``cadence_scale`` > 1：步频加快，源索引推进更快
     - ``double_support_offset`` > 0：双支撑相变长，在相位 0 / 0.5 附近源索引推进变慢
+    - ``ref_frames``：**参考序列**长度，决定钳位上界。输出帧数与参考帧数已不再
+      相等（见 :func:`auto_num_frames`），用 ``num_frames`` 钳位会把快速动作截断。
 
     双支撑扰动采用 :math:`g(\\phi) = \\phi - \\frac{a}{4\\pi}\\sin(4\\pi\\phi)`，
     其中 :math:`a = 3 \\cdot \\text{offset}`。该形式满足：
@@ -116,6 +145,7 @@ def build_time_map(    num_frames: int,
     ``(src_idx [T], notes)``
     """
     notes: List[str] = []
+    ref_n = int(ref_frames) if ref_frames else int(num_frames)
     t = torch.arange(num_frames, device=device, dtype=dtype)
 
     # 第一步：整体快慢
@@ -138,12 +168,12 @@ def build_time_map(    num_frames: int,
             warped = warped * (span / warped_span)
         base = warped.clamp_min(0.0)
 
-    if float(base.max()) > num_frames - 1 + 1e-6:
+    if float(base.max()) > ref_n - 1 + 1e-6:
         notes.append(
             f"步频放大导致源索引越界（需要 {float(base.max()):.1f} 帧、"
-            f"仅有 {num_frames - 1} 帧），尾部已钳位，该段目标会静止"
+            f"仅有 {ref_n - 1} 帧），尾部已钳位，该段目标会静止"
         )
-    return base.clamp(0.0, num_frames - 1.0), notes
+    return base.clamp(0.0, ref_n - 1.0), notes
 
 
 # --------------------------------------------------------------------------- #
@@ -164,8 +194,10 @@ class TargetSpec:
     #: ``[T, 3]`` 目标根节点世界位置
     root_world: Tensor
 
-    #: 目标托盘-胸骨水平距离（米），标量
-    tray_chest_distance: float
+    #: ``[T]`` 目标托盘-胸骨水平距离（米）。``None`` 表示无托盘。
+    #: 曾经是标量均值，导致恒等参数下仍有 3.92 的伪任务压力
+    #: （求解器用肩关节 24.6° 的旋转去抹平真实波动），已改为逐帧曲线。
+    tray_chest_distance: Optional[Tensor]
 
     #: ``[T]`` 重采样后的参考相位，供渲染抽帧复用
     phase: Tensor
@@ -175,6 +207,12 @@ class TargetSpec:
     @property
     def num_frames(self) -> int:
         return int(self.src_idx.shape[0])
+
+    @property
+    def tray_chest_distance_mean(self) -> float:
+        """逐帧目标的均值，仅用于日志与对照表。"""
+        return 0.0 if self.tray_chest_distance is None \
+            else float(self.tray_chest_distance.mean())
 
     def to(self, device: torch.device | str) -> "TargetSpec":
         """返回搬到指定设备的副本（``tray_chest_distance`` 是标量，原样保留）。"""
@@ -189,7 +227,8 @@ class TargetSpec:
             elbow_flex_left=self.elbow_flex_left.to(device),
             elbow_flex_right=self.elbow_flex_right.to(device),
             root_world=self.root_world.to(device),
-            tray_chest_distance=self.tray_chest_distance,
+            tray_chest_distance=(None if self.tray_chest_distance is None
+                                 else self.tray_chest_distance.to(device)),
             phase=self.phase.to(device),
             notes=list(self.notes),
         )
@@ -207,7 +246,7 @@ class TargetSpec:
             "elbow_flex_left": rng(self.elbow_flex_left),
             "root_travel_m": round(
                 float((self.root_world[-1, :2] - self.root_world[0, :2]).norm()), 4),
-            "tray_chest_distance": round(self.tray_chest_distance, 4),
+            "tray_chest_distance": round(self.tray_chest_distance_mean, 4),
             "notes": self.notes,
         }
 
@@ -225,7 +264,8 @@ def build_targets(
     curves                  : :func:`motionedit.features.extract_features` 的第二个返回值
     params                  : LLM 给出的一组参数（调用前应先 ``.clipped()``）
     tray_chest_distance_ref : 参考动作的托盘-胸骨距离（米）；``None`` 表示无托盘
-    num_frames              : 输出帧数，默认与参考等长
+    num_frames              : 输出帧数。``None``（默认）时由 :func:`auto_num_frames`
+                              按步频推导，使参考动作 100% 走完；显式传值会绕过这一机制
 
     Notes
     -----
@@ -234,13 +274,15 @@ def build_targets(
     """
     p = params
     ref_n = int(curves.knee_flex_left.shape[0])
-    n = int(num_frames) if num_frames else ref_n
+    n = int(num_frames) if num_frames else auto_num_frames(ref_n, p.cadence_scale)
     dev, dt = curves.knee_flex_left.device, curves.knee_flex_left.dtype
 
     src, notes = build_time_map(
         n, curves.gait.cycle_frames, p.cadence_scale, p.double_support_offset,
-        device=dev, dtype=dt,
+        device=dev, dtype=dt, ref_frames=ref_n,
     )
+    if n != ref_n:
+        notes.append(f"步频缩放 {p.cadence_scale:.2f} → 输出 {n} 帧（参考 {ref_n} 帧）")
 
     # --- 姿态目标：重采样后施加缩放/偏置 -------------------------------- #
     knee_l = resample(curves.knee_flex_left, src) * p.knee_flex_scale
@@ -261,7 +303,12 @@ def build_targets(
     root_target = torch.cat(
         [root[:1], root[:1] + torch.cumsum(scaled, dim=0)], dim=0)
 
-    tray_d = (tray_chest_distance_ref or 0.0) * p.tray_chest_distance_scale
+    tray_d = None
+    if curves.tray_chest_distance is not None:
+        tray_d = resample(curves.tray_chest_distance, src) * p.tray_chest_distance_scale
+    elif tray_chest_distance_ref:
+        tray_d = torch.full((n,), float(tray_chest_distance_ref) * p.tray_chest_distance_scale,
+                            device=dev, dtype=dt)
 
     return TargetSpec(
         src_idx=src,
@@ -271,7 +318,7 @@ def build_targets(
         elbow_flex_left=elbow_l,
         elbow_flex_right=elbow_r,
         root_world=root_target,
-        tray_chest_distance=float(tray_d),
+        tray_chest_distance=tray_d,
         phase=resample(curves.phase, src),
         notes=notes,
     )
