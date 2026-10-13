@@ -59,10 +59,12 @@ from .rom import ROMPenalty
 from .rotation import quaternion_geodesic_sq
 from .skeleton import Skeleton
 from .targets import TargetSpec
+from .tray import GripCalibration, tray_frames_from_hands, tray_normal_from_frames
 
 __all__ = ["LossWeights", "MotionLoss", "differentiable_curves"]
 
 _UP = 2  # 世界坐标 Z 轴朝上
+_SQRT2 = 2.0 ** 0.5
 
 
 # --------------------------------------------------------------------------- #
@@ -77,8 +79,7 @@ def differentiable_curves(pose: Tensor, skel: Skeleton) -> Dict[str, Tensor]:
     def J(name: str) -> Tensor:
         return joints[:, skel.index(name)]
 
-    return {
-        "knee_flex_left": joint_angle_3pt(
+    return {        "knee_flex_left": joint_angle_3pt(
             J("mixamorig:LeftUpLeg"), J("mixamorig:LeftLeg"), J("mixamorig:LeftFoot")),
         "knee_flex_right": joint_angle_3pt(
             J("mixamorig:RightUpLeg"), J("mixamorig:RightLeg"), J("mixamorig:RightFoot")),
@@ -116,6 +117,18 @@ class LossWeights:
     w_smooth: float = 1.0
     w_contact: float = 1.0
 
+    # --- 托盘相关的两项物理有效性约束（workflow.md 的 A 类，不开放给 LLM）---
+    #: 闭链抓握：双手各自预测的托盘位姿不得分开。单位已换算到 deg²
+    w_grip: float = 1.0
+    #: 托盘保持水平：倒过头就不是合法的搬运动作。单边 hinge，deg²
+    w_level: float = 1.0
+    #: 抓握位置误差的换算率：1° ≙ 5 mm。选 5 mm 是因为参考动作的
+    #: 抓握残差实测 1.84 mm，超过 5 mm 就已经是真实脱手而非测量噪声
+    grip_deg_per_m: float = 200.0
+    #: 托盘允许的倾角余量（度），叠加在参考动作峰值之上。
+    #: 只罚"比参考动作做得更差"，不要求做到绝对水平（A_ref 自身就有 3.31°）
+    level_margin_deg: float = 0.5
+
     #: contact 项内部三个分量的相对配比：穿地 / 防滑 / 锚定
     contact_penetration: float = 1.0
     contact_slip: float = 1.0
@@ -144,6 +157,8 @@ class LossTerms:
     rom: Tensor
     smooth: Tensor
     contact: Tensor
+    grip: Tensor
+    level: Tensor
     task_parts: Dict[str, Tensor] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, float]:
@@ -151,7 +166,7 @@ class LossTerms:
         d = {
             "total": f(self.total), "task": f(self.task),
             "prior": f(self.prior), "rom": f(self.rom), "smooth": f(self.smooth),
-            "contact": f(self.contact),
+            "contact": f(self.contact), "grip": f(self.grip), "level": f(self.level),
         }
         d.update({f"task.{k}": f(v) for k, v in self.task_parts.items()})
         return d
@@ -178,6 +193,7 @@ class MotionLoss:
         dof_mask: Optional[Tensor] = None,
         fps: float = 24.0,
         contact_cfg: Optional[ContactConfig] = None,
+        grip: Optional[GripCalibration] = None,
     ) -> None:
         self.skel = skel
         self.ref_pose = ref_pose.detach()
@@ -186,6 +202,7 @@ class MotionLoss:
         self.w = weights or LossWeights()
         self.fps = float(fps)
         self.contact_cfg = contact_cfg or ContactConfig()
+        self.grip = grip.to(ref_pose.device) if grip is not None else None
 
         mask = skel.dof_mask() if dof_mask is None else dof_mask
         self.mask = mask.to(ref_pose.device)
@@ -244,7 +261,8 @@ class MotionLoss:
                 + w.contact_drift * drift)
 
     # ------------------------------------------------------------------ #
-    def _task(self, cur: Dict[str, Tensor]) -> tuple[Tensor, Dict[str, Tensor]]:
+    def _task(self, cur: Dict[str, Tensor],
+              tray_origin: Optional[Tensor]) -> tuple[Tensor, Dict[str, Tensor]]:
         t, w = self.target, self.w
         parts = {
             "knee": w.w_knee * (
@@ -256,10 +274,11 @@ class MotionLoss:
                 + (cur["elbow_flex_right"] - t.elbow_flex_right).pow(2).mean()),
             "root": w.w_root * (cur["root_world"] - t.root_world).pow(2).sum(-1).mean(),
         }
-        # 托盘-胸骨距离：通过双手中点与胸骨的水平距离间接约束
-        if t.tray_chest_distance > 0:
-            mid = 0.5 * (cur["hand_left"] + cur["hand_right"])
-            d = (mid[:, :2] - cur["chest_world"][:, :2]).norm(dim=-1)
+        # 托盘-胸骨距离：用**真实托盘原点**而非双手中点，参数语义才名实相符
+        if t.tray_chest_distance is not None:
+            ref = tray_origin if tray_origin is not None else \
+                0.5 * (cur["hand_left"] + cur["hand_right"])
+            d = (ref[:, :2] - cur["chest_world"][:, :2]).norm(dim=-1)
             parts["tray"] = w.w_root * (d - t.tray_chest_distance).pow(2).mean()
         return sum(parts.values()), parts  # type: ignore[return-value]
 
@@ -267,6 +286,44 @@ class MotionLoss:
         """姿势先验：仅在可优化骨骼上度量与 A_ref 的四元数平方弦距离。"""
         g = quaternion_geodesic_sq(pose[:, self.mask, :4], self.ref_pose[:, self.mask, :4])
         return g.mean()
+
+    # ------------------------------------------------------------------ #
+    def _tray(self, pose: Tensor) -> tuple[Tensor, Tensor, Optional[Tensor]]:
+        """抓握闭链与托盘水平两项，顺带返回托盘原点供任务项复用。
+
+        闭链：两只手扣在同一个刚体上，各自推出的托盘位姿必须重合。
+        之前没有这一项，实测右手会偏离其抓握点达 352 mm，双手间距从
+        0.579 m 塌缩到 0.31 m，而托盘宽 0.493 m——手落到盘面正中央造成穿模。
+
+        水平：腕关节在任务项里是个死自由度（实测仅动 0.82°），而手的世界朝向
+        是整条链的乘积；``elbow_flex_offset`` 一动前臂就转，托盘实测倾倒 ~30°。
+        加上本项后，求解器会自发用腕关节去补偿——正是真人端盘时做的事。
+        """
+        zero = pose.new_zeros(())
+        if self.grip is None:
+            return zero, zero, None
+
+        w = self.w
+        frames = tray_frames_from_hands(
+            self.skel.forward_kinematics(pose), self.skel, self.grip)   # [K,T,4,4]
+        pos, rot = frames[:, :, :3, 3], frames[:, :, :3, :3]
+        origin = pos.mean(0)
+
+        # 位置分歧换算成度，旋转分歧由 Frobenius 距离近似成角度，两者同量纲
+        d_pos = (pos - origin.unsqueeze(0)).norm(dim=-1).sum(0)
+        d_rot = torch.rad2deg(
+            (rot - rot.mean(0, keepdim=True)).flatten(2).norm(dim=-1).sum(0) / _SQRT2)
+        grip = ((d_pos * w.grip_deg_per_m).pow(2) + d_rot.pow(2)).mean()
+
+        normal = tray_normal_from_frames(frames, self.grip)
+        up = torch.zeros_like(normal)
+        up[:, _UP] = 1.0
+        # 用 asin(|n × up|) 而非 acos(n·up)：后者在完全水平处梯度发散
+        sin_t = torch.linalg.cross(normal, up, dim=-1).norm(dim=-1)
+        tilt = torch.rad2deg(torch.asin(sin_t.clamp(max=1.0 - 1e-6)))
+        allow = self.grip.tilt_max_deg + w.level_margin_deg
+        level = torch.relu(tilt - allow).pow(2).mean()
+        return grip, level, origin
 
     def _smooth(self, pose: Tensor) -> Tensor:
         """二阶差分：惩罚加速度，抑制高频抖动（一阶差分会把正常运动也压掉）。"""
@@ -283,16 +340,19 @@ class MotionLoss:
         w = self.w.at(progress)
         cur = differentiable_curves(pose, self.skel)
 
-        task, parts = self._task(cur)
+        grip, level, tray_origin = self._tray(pose)
+        task, parts = self._task(cur, tray_origin)
         prior = self._prior(pose)
         rom = self.rom(pose)
         smooth = self._smooth(pose)
         contact = self._contact(pose)
 
         total = (task + w.w_prior * prior + w.w_rom * rom
-                 + w.w_smooth * smooth + w.w_contact * contact)
+                 + w.w_smooth * smooth + w.w_contact * contact
+                 + w.w_grip * grip + w.w_level * level)
         return LossTerms(total=total, task=task, prior=prior, rom=rom,
-                         smooth=smooth, contact=contact, task_parts=parts)
+                         smooth=smooth, contact=contact, grip=grip, level=level,
+                         task_parts=parts)
 
     # ------------------------------------------------------------------ #
     def calibrate(self, pose: Tensor, ratios: Optional[Dict[str, float]] = None) -> LossWeights:
