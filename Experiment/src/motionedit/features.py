@@ -95,6 +95,9 @@ class FeatureCurves:
     root_world: Tensor           # [T,3] 根节点世界位置
     com_height: Tensor           # [T]
     gait: GaitPhase
+    #: [T] 托盘到胸骨的水平距离。必须是曲线而非均值：用均值做逐帧目标
+    #: 等于要求该距离每帧恒定，会逼求解器用肩关节反向旋转去抵消躯干起伏
+    tray_chest_distance: Optional[Tensor] = None
 
 
 # --------------------------------------------------------------------------- #
@@ -137,9 +140,11 @@ def extract_features(
     cadence = 2.0 * seq.fps / gait.cycle_frames if gait.cycle_frames > 0 else 0.0
 
     tray_dist = None
+    tray_curve = None
     if tray_name and tray_name in seq.objects:
         tray_xy = seq.objects[tray_name][:, 4:6]
-        tray_dist = float((tray_xy - chest[:, :2]).norm(dim=-1).mean())
+        tray_curve = (tray_xy - chest[:, :2]).norm(dim=-1)
+        tray_dist = float(tray_curve.mean())
 
     feats = GaitFeatures(
         num_frames=seq.num_frames,
@@ -171,5 +176,6 @@ def extract_features(
         root_world=hips,
         com_height=hips[:, _UP],
         gait=gait,
+        tray_chest_distance=tray_curve,
     )
     return feats, curves
