@@ -45,6 +45,7 @@ def main() -> int:
     ap.add_argument("--video-stride", type=int, default=1)
     ap.add_argument("--no-video", action="store_true")
     ap.add_argument("--gif", action="store_true")
+    ap.add_argument("--gif-width", type=int, default=1920, help="GIF 横向最大宽度")
     ap.add_argument("--no-crop", action="store_true",
                     help="关闭宫格裁剪（调试构图时用；正式跑请保持开启）")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -58,6 +59,7 @@ def main() -> int:
         video_stride=args.video_stride,
         write_video=not args.no_video,
         write_gif=args.gif,
+        gif_max_width=args.gif_width,
     )
     grid = GridSpec(rows=args.rows, cols=args.cols, cell_px=args.cell_px,
                     crop_to_subject=not args.no_crop)
