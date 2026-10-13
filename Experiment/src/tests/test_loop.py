@@ -29,7 +29,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from motionedit.clients import (                                   # noqa: E402
-    ApiVLMClient, ManualLLMClient, ManualVLMClient, PendingManualInput,
+    GEMINI_VIDEO_FPS, ApiVLMClient, GeminiLLMClient, GeminiVLMClient,
+    ManualLLMClient, ManualVLMClient, PendingManualInput,
 )
 from motionedit.history import History, StopReason, TerminationConfig  # noqa: E402
 from motionedit.outer_loop import (                                # noqa: E402
@@ -275,6 +276,66 @@ def test_clients(tmp: Path):
         check("API 适配层未实现时明确报错", True)
 
 
+def test_gemini_client():
+    """Gemini 适配层的离线部分。真正的调用只能在有 API Key 的 Linux 机上跑，
+    但响应体解析可以用探针实测到的真实字段形状做回归。"""
+    print("\n[6b] Gemini 适配层（离线）")
+    cli = GeminiVLMClient("gemini-3.8-flash", temperature=0.0, seed=0, max_tokens=2048)
+    check("视频采样率默认 12fps（1fps 下模型会把屈膝深浅答反）",
+          cli.video_fps == GEMINI_VIDEO_FPS == 12.0, f"{cli.video_fps}")
+    check("默认强制 JSON 输出", cli.json_mode)
+    check("默认用完即删上传件（云端文件会过期，权威副本在本地）", cli.delete_uploads)
+    check("LLM 侧不传素材故不删", GeminiLLMClient("gemini-3.8-flash").delete_uploads is False)
+
+    # 以下字段形状来自探针 ⑨ 的真实返回体
+    class _Det:
+        def __init__(self, m, n): self.modality, self.token_count = m, n
+
+    class _U:
+        prompt_token_count = 4776
+        candidates_token_count = 87
+        thoughts_token_count = 742
+        total_token_count = 5605
+        prompt_tokens_details = [_Det("MediaModality.VIDEO", 4674),
+                                 _Det("MediaModality.TEXT", 102)]
+
+    class _Cand:
+        finish_reason = "STOP"
+
+    class _Http:
+        headers = {"x-gemini-service-tier": "standard"}
+
+    class _Resp:
+        text = '{"weight": 3}'
+        model_version = "gemini-3.8-flash"
+        response_id = "VLbOatzULaTyvdIPqsLj-AY"
+        candidates = [_Cand()]
+        usage_metadata = _U()
+        sdk_http_response = _Http()
+
+        def model_dump(self, mode="json"):
+            return {"model_version": self.model_version}
+
+    body = cli._to_body(_Resp())
+    check("提取 model 回显（用于检测静默降级）", body["model"] == "gemini-3.8-flash")
+    check("提取 response_id", body["response_id"] == "VLbOatzULaTyvdIPqsLj-AY")
+    check("提取 finish_reason", body["finish_reason"] == "STOP")
+    check("提取 service_tier", body["service_tier"] == "standard")
+    check("按模态拆分 token", body["usage"]["by_modality"] == {"VIDEO": 4674, "TEXT": 102},
+          str(body["usage"]["by_modality"]))
+    check("记录思考 token（实测远大于输出 token，计费必须算上）",
+          body["usage"]["thought_tokens"] == 742)
+    check("完整返回体原样落盘", body["raw"]["model_version"] == "gemini-3.8-flash")
+    text, model, usage = cli._unpack(body)
+    check("_unpack 三元组正确",
+          text == '{"weight": 3}' and model == "gemini-3.8-flash"
+          and usage["total_tokens"] == 5605)
+
+    class _NoUsage:
+        text = "x"
+    check("缺字段时不崩", cli._to_body(_NoUsage())["usage"] == {})
+
+
 # --------------------------------------------------------------------------- #
 class _FakeRenderer:
     """假渲染器：只产出占位文件，验证循环的产物登记与同场对比拼图逻辑。"""
@@ -473,6 +534,7 @@ def main() -> int:
         test_prompts()
         test_extract_json()
         test_clients(tmp)
+        test_gemini_client()
         test_loop_end_to_end(tmp)
         test_noise_probe(tmp)
     finally:
