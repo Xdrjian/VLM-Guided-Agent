@@ -39,7 +39,8 @@ from motionedit.params import GaitParams                      # noqa: E402
 from motionedit.skeleton import Skeleton                      # noqa: E402
 from motionedit.solver import SolverConfig, solve             # noqa: E402
 from motionedit.targets import build_targets                  # noqa: E402
-from motionedit.tray import update_tray_in_sequence           # noqa: E402
+from motionedit.targets import resample_objects               # noqa: E402
+from motionedit.tray import calibrate_grip, update_tray_in_sequence  # noqa: E402
 
 DEFAULT_SKEL = REPO / "humoto/human_model/human_model_up_bone_zup.json"
 DEFAULT_MOTION = REPO / "Experiment/pipeline/up_bone/A_ref_straight"
@@ -98,17 +99,19 @@ def main() -> int:
     print(json.dumps(target.summary(), ensure_ascii=False, indent=2))
 
     banner("4. 求解")
+    grip = calibrate_grip(seq, skel, tray_name=TRAY)
+    print(f"  抓握标定 {json.dumps(grip.summary(), ensure_ascii=False)}")
     res = solve(seq, skel, target, cfg=SolverConfig(
         adam_iters=args.adam_iters, lbfgs_iters=args.lbfgs_iters,
-        device=args.device, log_every=max(args.adam_iters // 6, 1)))
+        device=args.device, log_every=max(args.adam_iters // 6, 1)), grip=grip)
     print(json.dumps(res.summary(), ensure_ascii=False, indent=2))
 
     banner("5. 结果对比（参考 → 目标 → 实际）")
     out = MotionSequence(pose=res.pose.cpu(), bone_names=seq.bone_names,
-                         objects={k: v.clone() for k, v in seq.objects.items()},
+                         objects=resample_objects(seq.objects, target.src_idx),
                          fps=seq.fps, meta=seq.meta,
                          object_models=seq.object_models)
-    out = update_tray_in_sequence(out, skel, tray_name=TRAY)
+    out = update_tray_in_sequence(out, skel, grip)
     new_feats, _ = extract_features(out, skel, tray_name=TRAY)
 
     rows = [
@@ -122,7 +125,7 @@ def main() -> int:
          ref_feats.cadence_steps_per_s * params.cadence_scale,
          new_feats.cadence_steps_per_s),
         ("托盘-胸骨距离 (m)", ref_feats.tray_chest_distance_mean,
-         target.tray_chest_distance, new_feats.tray_chest_distance_mean),
+         target.tray_chest_distance_mean, new_feats.tray_chest_distance_mean),
     ]
     print(f"  {'指标':<20}{'参考':>10}{'目标':>10}{'实际':>10}{'误差':>10}")
     for name, a, b, cval in rows:
