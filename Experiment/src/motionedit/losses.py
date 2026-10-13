@@ -68,13 +68,17 @@ _SQRT2 = 2.0 ** 0.5
 
 
 # --------------------------------------------------------------------------- #
-def differentiable_curves(pose: Tensor, skel: Skeleton) -> Dict[str, Tensor]:
+def differentiable_curves(pose: Tensor, skel: Skeleton,
+                         world: Optional[Tensor] = None) -> Dict[str, Tensor]:
     """从姿态张量直接算出任务项需要的角度/位置曲线，全程保持梯度。
 
     与 :func:`motionedit.features.extract_features` 计算的是同一批量，但后者会做
     ``float()`` 转换用于报告，梯度会断掉，故优化循环中必须用本函数。
+
+    ``world`` 为已算好的 FK 结果，传入可避免重复计算（FK 是 65 根骨骼的
+    Python 循环，是每次前向的主要开销）。
     """
-    joints = skel.joint_positions(pose)
+    joints = (skel.forward_kinematics(pose) if world is None else world)[..., :3, 3]
 
     def J(name: str) -> Tensor:
         return joints[:, skel.index(name)]
@@ -231,7 +235,7 @@ class MotionLoss:
             ).to(ref_pose.dtype)
 
     # ------------------------------------------------------------------ #
-    def _contact(self, pose: Tensor) -> Tensor:
+    def _contact(self, pose: Tensor, world: Optional[Tensor] = None) -> Tensor:
         """支撑脚不滑动、不穿地。
 
         三个分量：
@@ -240,7 +244,7 @@ class MotionLoss:
         3. **锚定**：同样在支撑帧上，惩罚脚相对参考位置的漂移，防止整只脚
            以匀速平移的方式"合法地"滑过去（只罚速度时，恒定漂移量罚不到）。
         """
-        joints = self.skel.joint_positions(pose)
+        joints = (self.skel.forward_kinematics(pose) if world is None else world)[..., :3, 3]
         pos = joints[:, self.foot_idx]                                  # [T,4,3]
         w = self.w
         penetration = torch.relu(self.ground_z - pos[..., _UP]).pow(2).mean()
@@ -288,7 +292,8 @@ class MotionLoss:
         return g.mean()
 
     # ------------------------------------------------------------------ #
-    def _tray(self, pose: Tensor) -> tuple[Tensor, Tensor, Optional[Tensor]]:
+    def _tray(self, pose: Tensor,
+              world: Optional[Tensor] = None) -> tuple[Tensor, Tensor, Optional[Tensor]]:
         """抓握闭链与托盘水平两项，顺带返回托盘原点供任务项复用。
 
         闭链：两只手扣在同一个刚体上，各自推出的托盘位姿必须重合。
@@ -305,7 +310,8 @@ class MotionLoss:
 
         w = self.w
         frames = tray_frames_from_hands(
-            self.skel.forward_kinematics(pose), self.skel, self.grip)   # [K,T,4,4]
+            self.skel.forward_kinematics(pose) if world is None else world,
+            self.skel, self.grip)                                       # [K,T,4,4]
         pos, rot = frames[:, :, :3, 3], frames[:, :, :3, :3]
         origin = pos.mean(0)
 
@@ -338,14 +344,15 @@ class MotionLoss:
     # ------------------------------------------------------------------ #
     def __call__(self, pose: Tensor, progress: float = 0.0) -> LossTerms:
         w = self.w.at(progress)
-        cur = differentiable_curves(pose, self.skel)
+        world = self.skel.forward_kinematics(pose)
+        cur = differentiable_curves(pose, self.skel, world)
 
-        grip, level, tray_origin = self._tray(pose)
+        grip, level, tray_origin = self._tray(pose, world)
         task, parts = self._task(cur, tray_origin)
         prior = self._prior(pose)
         rom = self.rom(pose)
         smooth = self._smooth(pose)
-        contact = self._contact(pose)
+        contact = self._contact(pose, world)
 
         total = (task + w.w_prior * prior + w.w_rom * rom
                  + w.w_smooth * smooth + w.w_contact * contact
