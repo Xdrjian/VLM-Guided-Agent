@@ -155,8 +155,13 @@ def write_video(frames: Sequence[np.ndarray], path: Path | str,
 
 
 def write_gif(frames: Sequence[np.ndarray], path: Path | str,
-              fps: float = 12.0, max_width: int = 720) -> Path:
-    """写出 gif（部分模型的图像接口更适合吃 gif/静图序列，留作输入形态备选）。"""
+              fps: float = 24.0, max_width: int = 1280) -> Path:
+    """写出 gif。
+
+    GIF 的帧间延迟以**厘秒**存储，24fps = 4.2 厘秒；大量播放器会把小于 2 厘秒的
+    延迟强制改成 10 厘秒（=10fps）。因此 **gif 结构上无法忠实表达高帧率**，
+    做绝对速度判断时请用 mp4。
+    """
     try:
         import imageio.v2 as imageio
     except ImportError as e:
@@ -172,5 +177,9 @@ def write_gif(frames: Sequence[np.ndarray], path: Path | str,
             img = cv2.resize(img, (max_width, int(round(img.shape[0] * s))),
                              interpolation=cv2.INTER_AREA)
         out.append(img)
-    imageio.mimsave(str(p), out, duration=1.0 / float(fps), loop=0)
+    # imageio 跨版本对 duration 的单位（秒/毫秒）不一致，优先用语义明确的 fps
+    try:
+        imageio.mimsave(str(p), out, format="GIF", fps=float(fps), loop=0)
+    except TypeError:
+        imageio.mimsave(str(p), out, format="GIF", duration=1000.0 / float(fps), loop=0)
     return p
