@@ -97,6 +97,10 @@ def main() -> int:
         sc = rec.get("score")
         if sc:
             print(f"  打分：{' '.join(f'{k}={sc[k]}' for k in SCORE_FIELDS)}")
+            comp = sc.get("comparison") or {}
+            if comp:
+                cells = " ".join(f"{k}={comp.get(k, '?')}" for k in SCORE_FIELDS)
+                print(f"  对比判定：{cells}")
             for k in SCORE_FIELDS:
                 c = (sc.get("comments") or {}).get(k, "")
                 if c:
