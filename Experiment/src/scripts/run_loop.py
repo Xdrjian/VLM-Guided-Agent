@@ -119,6 +119,8 @@ def main() -> int:
     g.add_argument("--score-target", type=float, default=0.90)
     g.add_argument("--max-rounds", type=int, default=20)
     g.add_argument("--improvement-margin", type=float, default=0.02)
+    g.add_argument("--ref-naturalness-floor", type=int, default=7,
+                   help="第0轮自然度健康检查下限；实测动捕真值稳定得 7 分")
 
     g = ap.add_argument_group("求解器")
     g.add_argument("--adam-iters", type=int, default=600)
@@ -170,6 +172,7 @@ def main() -> int:
         termination=TerminationConfig(patience=args.patience,
                                       score_target=args.score_target,
                                       max_rounds=args.max_rounds,
+                                      ref_naturalness_floor=args.ref_naturalness_floor,
                                       improvement_margin=args.improvement_margin),
         vlm_repeats=args.vlm_repeats,
         reference_motion=Path(args.motion))
