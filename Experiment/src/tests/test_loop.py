@@ -38,7 +38,7 @@ from motionedit.outer_loop import (                                # noqa: E402
 )
 from motionedit.params import DEFAULT_PARAMS, GaitParams           # noqa: E402
 from motionedit.prompts import (                                   # noqa: E402
-    GridSpec, extract_json, render_llm_prompt, render_vlm_prompt,
+    GridSpec, VideoSpec, extract_json, render_llm_prompt, render_vlm_prompt,
     render_vlm_prompt_round0,
 )
 from motionedit.records import EvidenceStore, RawResponse, RoundRecord, VLMScore  # noqa: E402
@@ -373,13 +373,51 @@ def _scripted_client(answers):
     class C:
         name = "scripted"
 
-        def call(self, system, user, images=()):
+        def call(self, system, user, media=()):
             a = answers[min(box["i"], len(answers) - 1)]
             box["i"] += 1
             return RawResponse(text=a, body={}, model="scripted-2026-01-01",
-                               request={"images": [str(p) for p in images]},
+                               request={"media": [str(p) for p in media]},
                                source="api")
     return C()
+
+
+def test_media_spec():
+    """素材规格必须自己决定提交哪份产物。
+
+    这里曾有一个不会报错的坑：prompt 正文已改成"以下是 2 段视频"，
+    而 outer_loop 仍硬编码提交 6 张宫格图——模型会按文字描述去解读图片，
+    给出看似合理实则错位的评分，全程不抛任何异常。
+    """
+    print("\n[6c] 素材规格：prompt 正文与实际附件必须一致")
+
+    class _R:
+        grids = [Path("a_cam1.png"), Path("a_cam2.png"), Path("a_cam3.png")]
+        video = Path("a_video.mp4")
+
+    class _NoVideo:
+        grids = [Path("a.png")]
+        video = None
+
+    v, g = VideoSpec(), GridSpec()
+    check("VideoSpec 取视频", v.select(_R()) == [Path("a_video.mp4")])
+    check("GridSpec 取宫格图", len(g.select(_R())) == 3)
+    check("两者的 artifact_key 不同",
+          v.artifact_key == "video" and g.artifact_key == "grids")
+    check("每个动作提交的份数",
+          v.items_per_motion == 1 and g.items_per_motion == 3)
+    try:
+        v.select(_NoVideo())
+        check("VideoSpec 遇到无视频应报错而非静默降级", False)
+    except ValueError as e:
+        check("VideoSpec 遇到无视频应报错而非静默降级", "视频" in str(e))
+
+    p_v = render_vlm_prompt(3, 30.0, None, v)
+    p_g = render_vlm_prompt(3, 30.0, None, g)
+    check("视频 prompt 声明 2 段", "2 段视频" in p_v)
+    check("宫格 prompt 声明 6 张", "6 张宫格图" in p_g)
+    check("视频 prompt 说明时长差异是真实差异而非渲染错误",
+          "不是渲染错误" in p_v)
 
 
 def test_loop_end_to_end(tmp: Path):
@@ -445,16 +483,17 @@ def test_loop_end_to_end(tmp: Path):
     check("回滚后最佳仍为第1轮", hist.best.round_index == 1)
     check("停滞达标后终止", hist.should_stop() == StopReason.NO_IMPROVEMENT)
 
-    # 同场对比：第 N 轮应提交 2×机位数 张图
+    # 同场对比：视频形态下第 N 轮应提交 2 段（历史最佳 + 候选）
     req = EvidenceStore(run).read_json(
         EvidenceStore(run).round_dir(2) / "vlm_response.json")["request"]
-    check("第2轮提交 6 张图（左历史最佳 + 右候选）", len(req["images"]) == 6,
-          str(len(req["images"])))
-    check("左列来自历史最佳（第1轮）", "round001" in req["images"][0], req["images"][0])
-    check("右列来自本轮候选", "round002" in req["images"][-1], req["images"][-1])
+    check("第2轮提交 2 段视频（历史最佳 + 候选）", len(req["media"]) == 2,
+          str(len(req["media"])))
+    check("第一段来自历史最佳（第1轮）", "round001" in req["media"][0], req["media"][0])
+    check("第二段来自本轮候选", "round002" in req["media"][-1], req["media"][-1])
     req0 = EvidenceStore(run).read_json(
         EvidenceStore(run).round_dir(0) / "vlm_response.json")["request"]
-    check("第0轮只提交 3 张图", len(req0["images"]) == 3, str(len(req0["images"])))
+    check("第0轮只提交 1 段视频", len(req0["media"]) == 1, str(len(req0["media"])))
+    check("提交的是视频而非宫格图", req0["media"][0].endswith(".mp4"), req0["media"][0])
 
     # 证据包完整性
     store = EvidenceStore(run)
@@ -465,8 +504,9 @@ def test_loop_end_to_end(tmp: Path):
     check("run_meta.json 已落盘", (run / "run_meta.json").exists())
     check("history.json 已落盘", (run / "history.json").exists())
     check("留底视频已登记", "video" in hist.records[1].artifacts)
-    check("run_meta 记录宫格规格",
-          store.read_json(run / "run_meta.json")["grid"]["rows"] == 2)
+    check("宫格图仍照常登记（论文插图要用）", "grids" in hist.records[1].artifacts)
+    check("run_meta 记录素材形态为视频",
+          store.read_json(run / "run_meta.json")["media"]["kind"] == "video")
 
     # 断点续跑：从磁盘重建应得到同一状态
     loop2 = OuterLoop(cfg, vlm_factory, llm_factory, renderer, _fake_solver)
@@ -535,6 +575,7 @@ def main() -> int:
         test_extract_json()
         test_clients(tmp)
         test_gemini_client()
+        test_media_spec()
         test_loop_end_to_end(tmp)
         test_noise_probe(tmp)
     finally:
