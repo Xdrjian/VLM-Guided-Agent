@@ -216,6 +216,11 @@ class OuterLoop:
             artifacts=self._artifacts(render, solved),
         )
         rec.artifacts["vlm_calls"] = str(len(resps))
+        if score is not None and best is not None:
+            bad = score.check_consistency(best.score)
+            if bad:
+                # 不自动修正分数：那会把模型的矛盾藏起来。只记录，交由人工判断
+                rec.warnings.extend(f"VLM 对比判定与分数矛盾：{b}" for b in bad)
         return rec
 
     # -------------------------------------------------------------- 子步 -- #
@@ -295,7 +300,8 @@ class OuterLoop:
                 for f in fields_}
         # 评语取中位数最接近的那一次，保持语义与分数自洽
         pivot = min(scores, key=lambda s: sum(abs(getattr(s, f) - vals[f]) for f in fields_))
-        return VLMScore(comments=dict(pivot.comments), **vals)
+        return VLMScore(comments=dict(pivot.comments),
+                        comparison=dict(pivot.comparison), **vals)
 
     @staticmethod
     def _spread(scores: List[VLMScore]) -> Dict[str, float]:
