@@ -87,6 +87,56 @@ def test_score():
 
 
 # --------------------------------------------------------------------------- #
+def test_comparison_verdict():
+    """逐维对比判定与分数的一致性校验。
+
+    首次真实运行实测到的失效模式：模型在评语里描述出递进差异
+    （无负重感 → 略有 → 一定），四个 Effort 维度的分数却全程恒为 3。
+    评语与分数自相矛盾时不会抛任何异常，只会让收敛判断失去信号，
+    故必须在代码里显式校验。
+    """
+    print("\n[2b] 对比判定与分数一致性")
+    anchor = _score(w=3, t=3, s=3, f=3, n=7)
+
+    bad = VLMScore(weight=3, time=3, space=3, flow=3, naturalness=6,
+                   comparison={"weight": "better", "time": "same",
+                               "space": "better", "flow": "same",
+                               "naturalness": "worse"})
+    probs = bad.check_consistency(anchor)
+    check("判为 better 但分数不升 → 检出", len(probs) == 2, str(probs))
+    check("判为 worse 且分数确实降 → 不误报",
+          all("naturalness" not in p for p in probs))
+
+    good = VLMScore(weight=4, time=3, space=4, flow=3, naturalness=6,
+                    comparison={"weight": "better", "time": "same",
+                                "space": "better", "flow": "same",
+                                "naturalness": "worse"})
+    check("判定与分数一致 → 无告警", good.check_consistency(anchor) == [])
+    check("无锚点时不校验（第0轮）", good.check_consistency(None) == [])
+    check("非法判定值被拦下",
+          bool(VLMScore(weight=3, time=3, space=3, flow=3, naturalness=7,
+                        comparison={"weight": "maybe"}).validate()))
+
+    rt = VLMScore.from_dict(good.to_dict())
+    check("comparison 可往返序列化", rt.comparison == good.comparison)
+    check("缺 comparison 字段时容忍（向后兼容）",
+          VLMScore.from_dict({"weight": 3, "time": 3, "space": 3, "flow": 3,
+                              "naturalness": 7}).comparison == {})
+
+    # prompt 侧：有锚点时必须要求 comparison，第 0 轮不要求
+    anchor_rec = RoundRecord(round_index=0, params=DEFAULT_PARAMS,
+                             score=anchor, is_reference=True)
+    p_pair = render_vlm_prompt(2, 30.0, anchor_rec, VideoSpec())
+    p_solo = render_vlm_prompt(1, 30.0, None, VideoSpec())
+    check("有锚点时要求 comparison 字段", '"comparison"' in p_pair)
+    check("无锚点时不要求 comparison", '"comparison"' not in p_solo)
+    check("明示一致性硬性要求", "严格高于" in p_pair)
+    check("已删除逼中庸的指令",
+          "保留打分空间" not in p_pair and "不要在早期轮次" not in p_pair)
+    check("要求充分使用整个分档区间", "充分使用整个分档区间" in p_pair)
+    check("声明只评判动作、不评判渲染质量", "不得因此扣分" in p_pair)
+
+
 def test_records(tmp: Path):
     print("\n[2] 证据包 EvidenceStore")
     store = EvidenceStore(tmp / "run_a")
@@ -569,6 +619,7 @@ def main() -> int:
     tmp = Path(tempfile.mkdtemp(prefix="motionedit_loop_"))
     try:
         test_score()
+        test_comparison_verdict()
         test_records(tmp)
         test_history(tmp)
         test_prompts()
