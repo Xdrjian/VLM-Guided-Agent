@@ -237,6 +237,11 @@ def _fmt_features(f: Dict[str, float]) -> str:
                        for k, v in f.items()}, ensure_ascii=False, indent=2)
 
 
+_JUDGE_SCOPE = """【评判对象的范围】
+你评判的是**动作本身**，不是画面质量。渲染用的是无贴图、无面部的素模，
+这是实验设定，**不得因此扣分**。请把它当作动作捕捉数据的标准可视化方式，
+只判断骨骼运动本身是否符合人体动作直觉、是否体现目标重量的语义特征。"""
+
 _SCORING_RULES = f"""请仅评估以下维度。**不要评估物理合理性**（是否浮空、穿地、脚部打滑、
 关节是否超出生理限位等），这些已由求解器的损失函数与几何检测机制保证，不属于你的职责范围；
 重复评判它们会与既有机制冲突。
@@ -252,12 +257,33 @@ _SCORING_RULES = f"""请仅评估以下维度。**不要评估物理合理性**�
 - 自然度 naturalness（1-10 分）：
 {_bars_block("naturalness")}
 
-注意：高分档位对应的是"真正挑不出毛病"的极端情况，而不是"第一眼觉得还不错"。
-请保留打分空间，不要在早期轮次就给出接近满分的评价。"""
+【打分纪律】
+1. **请充分使用整个分档区间。** 分数必须与你自己的评语一致：若评语写的是
+   "几乎看不出负重"，就不应给中间分；若评语写的是"自然度良好"，就不应给中等分。
+   逐档对照上面的文字锚点，挑出描述最贴切的那一档，而不是凭印象取中间值。
+2. **不要为了"留余地"而压低分数，也不要为了保守而向中间值靠拢。**
+   分数要反映你当下看到的事实；后续轮次如果更好，自然会拿到更高的分。
+3. 1 分与 5 分（1-10 档的 1 分与 10 分）都是正常可用的取值，不是禁区。
+
+{_JUDGE_SCOPE}"""
 
 _VLM_OUTPUT_FORMAT = """请严格以如下 JSON 格式输出（不要添加任何额外字段或文字）：
 {"weight": int, "time": int, "space": int, "flow": int, "naturalness": int,
  "comments": {"weight": str, "time": str, "space": str, "flow": str, "naturalness": str}}"""
+
+_VLM_OUTPUT_FORMAT_PAIR = """请严格以如下 JSON 格式输出（不要添加任何额外字段或文字）：
+{"comparison": {"weight": "better"|"worse"|"same", "time": ..., "space": ...,
+                "flow": ..., "naturalness": ...},
+ "weight": int, "time": int, "space": int, "flow": int, "naturalness": int,
+ "comments": {"weight": str, "time": str, "space": str, "flow": str, "naturalness": str}}
+
+字段含义与硬性要求：
+- ``comparison``：逐维度判定**本轮候选解相比历史最佳解**是更好/更差/无可见差异。
+  请先完成这一步，再决定分数。
+- 五个整数分数是给**本轮候选解**的。
+- **一致性要求（必须满足）**：某维度判为 ``better`` 时，该维度分数必须
+  **严格高于**历史最佳解在该维度的分数；判为 ``worse`` 时必须**严格低于**；
+  只有判为 ``same`` 时才允许相等。切勿出现"评语说有改善、分数却不变"。"""
 
 
 def render_vlm_prompt(round_index: int, target_weight_kg: float,
@@ -291,7 +317,7 @@ def render_vlm_prompt(round_index: int, target_weight_kg: float,
 {_SCORING_RULES}
 
 【输出格式】
-{_VLM_OUTPUT_FORMAT}
+{_VLM_OUTPUT_FORMAT_PAIR if best is not None else _VLM_OUTPUT_FORMAT}
 """
 
 
