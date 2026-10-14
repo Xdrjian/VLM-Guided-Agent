@@ -49,7 +49,10 @@ class TerminationConfig:
     #: 最大轮数兜底  🔴 待实测
     max_rounds: int = 20
     #: 第 0 轮自然度健康检查下限（原始分，1-10 档）。低于即告警（§4.4）
-    ref_naturalness_floor: int = 8
+    #: 🔵 实测：gemini-3.8-flash 对无贴图素模渲染的动捕真值稳定给 7 分
+    #: （exp02/exp03 共四次调用均为 7），原阈值 8 会让第 0 轮必然中断。
+    #: 取 7 仍能捕捉真正的退化，但不再把模型的固有偏差当成故障。
+    ref_naturalness_floor: int = 7
     #: 新解需超过历史最佳多少才算"提升"。设为 0 即严格大于；
     #: 噪声摸底后应设为略大于噪声标准差，避免把噪声当改进
     improvement_margin: float = 0.0
