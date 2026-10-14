@@ -68,6 +68,9 @@ DEFAULT_SCORE_WEIGHTS: Dict[str, float] = {
 
 SCORE_FIELDS = tuple(SCORE_RANGES.keys())
 
+#: ``comparison`` 字段的合法取值
+COMPARISON_VERDICTS = ("better", "worse", "same")
+
 
 # --------------------------------------------------------------------------- #
 @dataclass
@@ -84,6 +87,10 @@ class VLMScore:
     flow: int
     naturalness: int
     comments: Dict[str, str] = field(default_factory=dict)
+    #: 逐维度的"相比历史最佳解更好/更差/无差异"判定。
+    #: 首次实测发现模型会在评语里描述出递进差异（无→略有→一定），
+    #: 分数却死死压在量程正中的 3 分。强制它先表态再给分，并在代码里校验二者一致。
+    comparison: Dict[str, str] = field(default_factory=dict)
 
     # ------------------------------------------------------------------ #
     def scores(self) -> Dict[str, int]:
@@ -96,7 +103,32 @@ class VLMScore:
             v = getattr(self, k)
             if not isinstance(v, (int, float)) or not (lo <= v <= hi):
                 problems.append(f"{k}={v!r} 超出合法区间 [{lo}, {hi}]")
+        for k, verdict in self.comparison.items():
+            if verdict not in COMPARISON_VERDICTS:
+                problems.append(f"comparison.{k}={verdict!r} 不在 {COMPARISON_VERDICTS}")
         return problems
+
+    def check_consistency(self, anchor: Optional["VLMScore"]) -> List[str]:
+        """校验对比判定与分数是否矛盾。
+
+        “评语说有改善、分数却不变”是本项目实测到的具体失效模式；
+        没有这项校验，它不会报错，只会让收敛判断失去信号。
+        """
+        if anchor is None or not self.comparison:
+            return []
+        out: List[str] = []
+        for k in SCORE_FIELDS:
+            verdict = self.comparison.get(k)
+            if verdict is None:
+                continue
+            mine, theirs = int(getattr(self, k)), int(getattr(anchor, k))
+            if verdict == "better" and mine <= theirs:
+                out.append(f"{k}: 判为 better 但分数 {mine} 不高于锚点 {theirs}")
+            elif verdict == "worse" and mine >= theirs:
+                out.append(f"{k}: 判为 worse 但分数 {mine} 不低于锚点 {theirs}")
+            elif verdict == "same" and mine != theirs:
+                out.append(f"{k}: 判为 same 但分数 {mine} ≠ 锚点 {theirs}")
+        return out
 
     def normalized(self) -> Dict[str, float]:
         """把各维度线性归一化到 [0, 1]，消除 1-5 与 1-10 分档的量纲差异。"""
@@ -117,6 +149,8 @@ class VLMScore:
     def to_dict(self) -> Dict[str, Any]:
         d: Dict[str, Any] = self.scores()
         d["comments"] = dict(self.comments)
+        if self.comparison:
+            d["comparison"] = dict(self.comparison)
         return d
 
     @classmethod
@@ -130,7 +164,11 @@ class VLMScore:
         comments = d.get("comments") or {}
         if not isinstance(comments, dict):
             comments = {"_raw": str(comments)}
-        return cls(comments={str(k): str(v) for k, v in comments.items()}, **vals)
+        comp = d.get("comparison") or {}
+        if not isinstance(comp, dict):
+            comp = {}
+        return cls(comments={str(k): str(v) for k, v in comments.items()},
+                   comparison={str(k): str(v) for k, v in comp.items()}, **vals)
 
     def summary(self) -> str:
         s = self.scores()
