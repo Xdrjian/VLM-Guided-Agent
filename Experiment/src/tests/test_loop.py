@@ -88,53 +88,75 @@ def test_score():
 
 # --------------------------------------------------------------------------- #
 def test_comparison_verdict():
-    """逐维对比判定与分数的一致性校验。
+    """位置化对比判定 + 幅度，以及配对增量得分。
 
-    首次真实运行实测到的失效模式：模型在评语里描述出递进差异
-    （无负重感 → 略有 → 一定），四个 Effort 维度的分数却全程恒为 3。
-    评语与分数自相矛盾时不会抛任何异常，只会让收敛判断失去信号，
-    故必须在代码里显式校验。
+    实测走过的两次弯路：
+    ① 绝对 1-5 分整体塌缩到中值 3，四个 Effort 维度全程恒定；
+    ② 为救①而要求"充分使用整个分档区间"，又构成反向偏差——逼模型放大
+      本不存在的差距。故必须同时保留 tie / insufficient 这两个正当出口。
     """
-    print("\n[2b] 对比判定与分数一致性")
-    anchor = _score(w=3, t=3, s=3, f=3, n=7)
+    print("\n[2b] 位置化判定、幅度与配对增量")
+    s = VLMScore(weight=3, time=4, space=3, flow=3, naturalness=7,
+                 comparison={"weight": "second", "time": "second",
+                             "space": "tie", "flow": "insufficient",
+                             "naturalness": "tie"},
+                 magnitude={"weight": "clear", "time": "slight",
+                            "space": "none", "flow": "none",
+                            "naturalness": "none"})
+    d = s.pairwise_delta(candidate_is_second=True)
+    check("候选占优时增量为正", d is not None and d > 0, f"{d:.4f}")
+    check("交换位置后符号翻转（可用于位置偏差探针）",
+          abs(s.pairwise_delta(False) + d) < 1e-9)
+    check("tie / insufficient 不计分也不报错", s.check_consistency() == [])
+    check("自然度不计入配对增量（它是门槛不是奖励）",
+          abs(d - s.pairwise_delta(True, {"weight": 4, "time": 1, "space": 1,
+                                          "flow": 1, "naturalness": 999})) < 1e-9)
 
-    bad = VLMScore(weight=3, time=3, space=3, flow=3, naturalness=6,
-                   comparison={"weight": "better", "time": "same",
-                               "space": "better", "flow": "same",
-                               "naturalness": "worse"})
-    probs = bad.check_consistency(anchor)
-    check("判为 better 但分数不升 → 检出", len(probs) == 2, str(probs))
-    check("判为 worse 且分数确实降 → 不误报",
-          all("naturalness" not in p for p in probs))
-
-    good = VLMScore(weight=4, time=3, space=4, flow=3, naturalness=6,
-                    comparison={"weight": "better", "time": "same",
-                                "space": "better", "flow": "same",
-                                "naturalness": "worse"})
-    check("判定与分数一致 → 无告警", good.check_consistency(anchor) == [])
-    check("无锚点时不校验（第0轮）", good.check_consistency(None) == [])
-    check("非法判定值被拦下",
+    bad = VLMScore(weight=3, time=3, space=3, flow=3, naturalness=7,
+                   comparison={"weight": "tie", "time": "second"},
+                   magnitude={"weight": "large", "time": "none"})
+    probs = bad.check_consistency()
+    check("判 tie 却给大幅度 → 检出", any("tie" in p for p in probs), str(probs))
+    check("判有优劣却给 none → 检出", any("none" in p for p in probs), str(probs))
+    check("无配对信息时返回 None（调用方回退到绝对分）",
+          VLMScore(weight=3, time=3, space=3, flow=3, naturalness=7)
+          .pairwise_delta() is None)
+    check("非法取值被拦下",
           bool(VLMScore(weight=3, time=3, space=3, flow=3, naturalness=7,
-                        comparison={"weight": "maybe"}).validate()))
+                        comparison={"weight": "better"},
+                        magnitude={"weight": "huge"}).validate()))
 
-    rt = VLMScore.from_dict(good.to_dict())
-    check("comparison 可往返序列化", rt.comparison == good.comparison)
-    check("缺 comparison 字段时容忍（向后兼容）",
+    rt = VLMScore.from_dict(s.to_dict())
+    check("comparison / magnitude 可往返序列化",
+          rt.comparison == s.comparison and rt.magnitude == s.magnitude)
+    check("observations 键名被接受（prompt 里叫这个）",
           VLMScore.from_dict({"weight": 3, "time": 3, "space": 3, "flow": 3,
-                              "naturalness": 7}).comparison == {})
+                              "naturalness": 7,
+                              "observations": {"weight": "none_observed"}}
+                             ).comments["weight"] == "none_observed")
 
-    # prompt 侧：有锚点时必须要求 comparison，第 0 轮不要求
     anchor_rec = RoundRecord(round_index=0, params=DEFAULT_PARAMS,
-                             score=anchor, is_reference=True)
+                             score=_score(), is_reference=True)
     p_pair = render_vlm_prompt(2, 30.0, anchor_rec, VideoSpec())
     p_solo = render_vlm_prompt(1, 30.0, None, VideoSpec())
-    check("有锚点时要求 comparison 字段", '"comparison"' in p_pair)
-    check("无锚点时不要求 comparison", '"comparison"' not in p_solo)
-    check("明示一致性硬性要求", "严格高于" in p_pair)
-    check("已删除逼中庸的指令",
-          "保留打分空间" not in p_pair and "不要在早期轮次" not in p_pair)
-    check("要求充分使用整个分档区间", "充分使用整个分档区间" in p_pair)
+    check("有锚点时要求 comparison 与 magnitude",
+          '"comparison"' in p_pair and '"magnitude"' in p_pair)
+    check("无锚点时不要求", '"comparison"' not in p_solo)
+    check("证据字段排在分数之前",
+          p_pair.index('"observations"') < p_pair.index('"weight": int'))
+    check("提供 none_observed / insufficient_visibility 出口",
+          "none_observed" in p_pair and "insufficient_visibility" in p_pair)
+    check("明示不得为制造区分度而夸大差异", "夸大" in p_pair)
+    check("两段用中性标签，不告知哪段是历史最佳",
+          "动作 A" in p_pair and "历史最佳解**。" not in p_pair)
+    check("锚点分数仅作量表校准", "不要把它当作本次应该给出的答案" in p_pair)
+    check("交换顺序时标签跟着变",
+          "标记为动作 B。" in render_vlm_prompt(2, 30.0, anchor_rec,
+                                             VideoSpec(), swapped=True)
+          .split("【任务上下文】")[0].split("\n")[3])
+    check("已删除逼中庸的指令", "保留打分空间" not in p_pair)
     check("声明只评判动作、不评判渲染质量", "不得因此扣分" in p_pair)
+    check("把动捕真值定为自然度正参考点", "正参考点" in p_pair)
 
 
 def test_records(tmp: Path):
@@ -166,6 +188,51 @@ def test_records(tmp: Path):
 
 
 # --------------------------------------------------------------------------- #
+def test_naturalness_gate_and_pairwise(tmp: Path):
+    """自然度改作门槛、接受判定改用配对增量。
+
+    exp02 实测：Effort 四维全程恒定，只有自然度在动（7→6→6），
+    而它占一半权重且只会给"被编辑过的动作"扣分，于是每个候选都必然输给 A_ref，
+    循环结构上无法接受任何解。改为门槛后，它只阻止退化、不抑制改进。
+    """
+    print("\n[3b] 自然度门槛与配对接受")
+    cfg = TerminationConfig(patience=9, naturalness_floor=6)
+
+    def rec(i, *, nat=7, verdict=None, mag=None, total_hint=3):
+        sc = VLMScore(weight=total_hint, time=3, space=3, flow=3, naturalness=nat,
+                      comparison=verdict or {}, magnitude=mag or {})
+        return RoundRecord(round_index=i, params=DEFAULT_PARAMS, score=sc,
+                           is_reference=(i == 0))
+
+    h = History(cfg)
+    h.add(rec(0))
+    better = {"weight": "second", "time": "tie", "space": "tie", "flow": "tie"}
+    mags = {"weight": "clear", "time": "none", "space": "none", "flow": "none"}
+    r1 = h.add(rec(1, verdict=better, mag=mags))
+    check("配对判定为候选占优 → 接受", r1.accepted, r1.summary())
+    check("即使绝对分与锚点相同也能接受（跨调用漂移被绕开）",
+          r1.total_score == h.records[0].total_score)
+
+    worse = {"weight": "first", "time": "tie", "space": "tie", "flow": "tie"}
+    r2 = h.add(rec(2, verdict=worse, mag=mags))
+    check("配对判定为锚点占优 → 回滚", r2.rolled_back)
+
+    allties = {k: "tie" for k in ("weight", "time", "space", "flow")}
+    nones = {k: "none" for k in ("weight", "time", "space", "flow")}
+    r3 = h.add(rec(3, verdict=allties, mag=nones))
+    check("全部打平 → 不算提升，回滚", r3.rolled_back)
+
+    r4 = h.add(rec(4, nat=4, verdict=better, mag=mags))
+    check("自然度跌破门槛 → 即便 Effort 占优也回滚", r4.rolled_back)
+    check("回滚原因被记录", any("门槛" in w for w in r4.warnings), str(r4.warnings))
+
+    # 无配对信息时回退到绝对总分
+    h2 = History(TerminationConfig(patience=9, naturalness_floor=6))
+    h2.add(rec(0, total_hint=2))
+    r = h2.add(rec(1, total_hint=4))
+    check("无配对信息时回退到绝对分比较", r.accepted, r.summary())
+
+
 def test_history(tmp: Path):
     print("\n[3] History 接受/回滚/终止")
     h = History(TerminationConfig(patience=2, score_target=0.99, max_rounds=10))
@@ -233,12 +300,12 @@ def test_prompts():
     best = RoundRecord(1, GaitParams(knee_flex_scale=1.25), features={"knee_peak": 120.0},
                        score=_score(w=4), accepted=True)
     p = render_vlm_prompt(2, 30.0, best, grid)
-    check("VLM prompt 声明左右列含义", "历史最佳解" in p and "本轮候选解" in p)
+    check("VLM prompt 用中性标签标注两组素材", "动作 A" in p and "动作 B" in p)
     check("VLM prompt 含目标重量", "30kg" in p)
     check("VLM prompt 含 BARS 锚点", "完全看不出负重痕迹" in p)
     check("VLM prompt 明确排除物理合理性评判", "不要评估物理合理性" in p)
     check("VLM prompt 要求 JSON 输出", '"naturalness": int' in p)
-    check("VLM prompt 锚点取历史最佳而非上一轮", "第 1 轮" in p)
+    check("VLM prompt 带上锚点分数供量表校准", "量表校准" in p)
 
     p0 = render_vlm_prompt_round0(30.0, grid)
     check("第0轮 prompt 声明这是动捕真值", "ground truth" in p0)
@@ -621,6 +688,7 @@ def main() -> int:
         test_score()
         test_comparison_verdict()
         test_records(tmp)
+        test_naturalness_gate_and_pairwise(tmp)
         test_history(tmp)
         test_prompts()
         test_extract_json()
