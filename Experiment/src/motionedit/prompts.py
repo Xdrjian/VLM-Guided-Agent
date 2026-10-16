@@ -171,11 +171,12 @@ class GridSpec:
         """从一次渲染产物中挑出要提交给 VLM 的文件。"""
         return list(render.grids)
 
-    def layout_block(self) -> str:
+    def layout_block(self, swapped: bool = False) -> str:
         n = len(self.cameras)
-        return (f"- **左列**（前 {n} 张）：当前**历史最佳解**的 {n} 个机位。\n"
-                f"- **右列**（后 {n} 张）：**本轮候选解**的 {n} 个机位。\n"
-                f"- 左右同一行为同一机位，可直接逐帧对比。\n"
+        a, b = ("B", "A") if swapped else ("A", "B")
+        return (f"- **左列**（前 {n} 张）：标记为动作 {a} 的 {n} 个机位。\n"
+                f"- **右列**（后 {n} 张）：标记为动作 {b} 的 {n} 个机位。\n"
+                f"- 左右同一行为同一机位，可直接逐帧对比；提交顺序不含优劣暗示。\n"
                 + self.describe())
 
     @property
@@ -235,12 +236,14 @@ class VideoSpec:
                     f"相机固定不动，地面为棋盘格，因此人物相对地面的位移是真实可读的。")
         return f"每个动作按机位顺序提交 {len(self.cameras)} 段视频：{cams}。"
 
-    def layout_block(self) -> str:
+    def layout_block(self, swapped: bool = False) -> str:
         n = self.items_per_motion
         first = "第一段" if n == 1 else f"前 {n} 段"
         second = "第二段" if n == 1 else f"后 {n} 段"
-        return (f"- **{first}**：当前**历史最佳解**。\n"
-                f"- **{second}**：**本轮候选解**。\n"
+        a, b = ("B", "A") if swapped else ("A", "B")
+        return (f"- **{first}**：标记为动作 {a}。\n"
+                f"- **{second}**：标记为动作 {b}。\n"
+                f"- 两段均为待评估的动作，提交顺序不含任何优劣暗示。\n"
                 f"- 两者的**时长可能不同**。这是真实的动作差异（步频不同导致走完同一段"
                 f"动作所需时间不同），**不是渲染错误**，请把它作为判断依据之一。\n"
                 + self.describe())
@@ -271,7 +274,13 @@ def _fmt_features(f: Dict[str, float]) -> str:
 _JUDGE_SCOPE = """【评判对象的范围】
 你评判的是**动作本身**，不是画面质量。渲染用的是无贴图、无面部的素模，
 这是实验设定，**不得因此扣分**。请把它当作动作捕捉数据的标准可视化方式，
-只判断骨骼运动本身是否符合人体动作直觉、是否体现目标重量的语义特征。"""
+只判断骨骼运动本身是否符合人体动作直觉、是否体现目标重量的语义特征。
+
+【自然度的参照点】
+本流程的参考动作是**真实人类表演的动作捕捉录制**。请把这类未经编辑的动捕数据
+视为自然度的**正参考点（即 9~10 分应对应的水平）**，其余动作与之对照打分。
+自然度在本流程中是**底线性指标**：只要动作没有出现违反人体直觉的现象，
+就不应因为"看上去被加工过"而扣分。"""
 
 _SCORING_RULES = f"""请仅评估以下维度。**不要评估物理合理性**（是否浮空、穿地、脚部打滑、
 关节是否超出生理限位等），这些已由求解器的损失函数与几何检测机制保证，不属于你的职责范围；
@@ -289,62 +298,79 @@ _SCORING_RULES = f"""请仅评估以下维度。**不要评估物理合理性**�
 {_bars_block("naturalness")}
 
 【打分纪律】
-1. **请充分使用整个分档区间。** 分数必须与你自己的评语一致：若评语写的是
-   "几乎看不出负重"，就不应给中间分；若评语写的是"自然度良好"，就不应给中等分。
-   逐档对照上面的文字锚点，挑出描述最贴切的那一档，而不是凭印象取中间值。
-2. **不要为了"留余地"而压低分数，也不要为了保守而向中间值靠拢。**
-   分数要反映你当下看到的事实；后续轮次如果更好，自然会拿到更高的分。
-3. 1 分与 5 分（1-10 档的 1 分与 10 分）都是正常可用的取值，不是禁区。
+1. **先写证据，再给分。** 输出中 ``observations`` 在前、分数在后，请按这个顺序填写：
+   先记录你**实际看到**的现象，再根据这些现象对照文字锚点选档。
+2. 每条证据请指明**机位与时间段**（如"左侧机位 0:01—0:02"）。
+   若该维度未观察到可拿来判断的现象，请直接写 ``none_observed``；
+   若因视角、遮挡或分辨率看不清，请写 ``insufficient_visibility``。
+   **这两个输出都是正当结果，不是失败。**
+3. 分数要与你自己的证据一致，逐档对照上面的文字锚点挑出最贴切的那一档。
+   1 分与 5 分（1-10 档的两端）都是正常可用的取值，不是禁区；
+   也不要为了"留余地"而压低分数。
+4. **同样地，不要为了制造区分度而夸大你并未看到的差异。**
+   如果两段在某维度上确实看不出区别，就如实判为打平。
+   打平与看不清都是允许的结论，不必强行分出胜负。
 
 【每个维度该看哪里】
-打分前请逐项比对以下可观察量，并在评语中引用你实际看到的具体现象，
-避免停留在"基本相当""未见显著变化"这类笼统描述：
+以下是建议的观察对象，**不是应当出现的现象清单**——列出它们只是告诉你往哪里看，
+并不暗示那里一定有值得记录的东西：
 {_observables_block()}
 
 {_JUDGE_SCOPE}"""
 
-_VLM_OUTPUT_FORMAT = """请严格以如下 JSON 格式输出（不要添加任何额外字段或文字）：
-{"weight": int, "time": int, "space": int, "flow": int, "naturalness": int,
- "comments": {"weight": str, "time": str, "space": str, "flow": str, "naturalness": str}}"""
+_VLM_OUTPUT_FORMAT = """请严格以如下 JSON 格式输出（不要添加任何额外字段或文字，按字段顺序填写）：
+{"observations": {"weight": str, "time": str, "space": str, "flow": str, "naturalness": str},
+ "weight": int, "time": int, "space": int, "flow": int, "naturalness": int}
 
-_VLM_OUTPUT_FORMAT_PAIR = """请严格以如下 JSON 格式输出（不要添加任何额外字段或文字）：
-{"comparison": {"weight": "better"|"worse"|"same", "time": ..., "space": ...,
-                "flow": ..., "naturalness": ...},
- "weight": int, "time": int, "space": int, "flow": int, "naturalness": int,
- "comments": {"weight": str, "time": str, "space": str, "flow": str, "naturalness": str}}
+``observations`` 写你实际看到的现象及其机位与时间段；
+无可记录的现象写 ``none_observed``，看不清写 ``insufficient_visibility``。"""
 
-字段含义与硬性要求：
-- ``comparison``：逐维度判定**本轮候选解相比历史最佳解**是更好/更差/无可见差异。
-  请先完成这一步，再决定分数。
-- 五个整数分数是给**本轮候选解**的。
-- **一致性要求（必须满足）**：某维度判为 ``better`` 时，该维度分数必须
-  **严格高于**历史最佳解在该维度的分数；判为 ``worse`` 时必须**严格低于**；
-  只有判为 ``same`` 时才允许相等。切勿出现"评语说有改善、分数却不变"。"""
+_VLM_OUTPUT_FORMAT_PAIR = """请严格以如下 JSON 格式输出（不要添加任何额外字段或文字，按字段顺序填写）：
+{"observations": {"weight": str, "time": str, "space": str, "flow": str, "naturalness": str},
+ "comparison":   {"weight": "first"|"second"|"tie"|"insufficient", "time": ...,
+                  "space": ..., "flow": ..., "naturalness": ...},
+ "magnitude":    {"weight": "none"|"slight"|"clear"|"large", "time": ...,
+                  "space": ..., "flow": ..., "naturalness": ...},
+ "weight": int, "time": int, "space": int, "flow": int, "naturalness": int}
+
+字段含义：
+- ``observations``：先写证据。每条指明机位与时间段；无可记录写 ``none_observed``，
+  看不清写 ``insufficient_visibility``。
+- ``comparison``：该维度上**哪一段更符合高分描述**。
+  ``first`` = 第一段（动作 A）更好，``second`` = 第二段（动作 B）更好，
+  ``tie`` = 两段在该维度上看不出区别，``insufficient`` = 证据不足以判断。
+- ``magnitude``：上述差距的大小。判为 ``tie`` 或 ``insufficient`` 时必须写 ``none``；
+  判为 ``first``/``second`` 时不得写 ``none``。
+- 五个整数分数是给**动作 B**的绝对评分。
+
+请注意：``comparison`` 问的是位置（第一段/第二段），不要假设哪一段应该更好。"""
 
 
 def render_vlm_prompt(round_index: int, target_weight_kg: float,
                       best: Optional[RoundRecord],
-                      grid: Optional[Any] = None) -> str:
-    """常规轮次的 VLM prompt（历史最佳解在前、本轮候选解在后，同场对比）。
+                      grid: Optional[Any] = None,
+                      swapped: bool = False) -> str:
+    """常规轮次的 VLM prompt（两段同场对比）。
 
-    ``grid`` 接受 :class:`GridSpec` 或 :class:`VideoSpec`，二者提供同一套
-    ``items_per_motion`` / ``media_noun`` / ``layout_block`` 接口。
+    ``grid`` 接受 :class:`GridSpec` 或 :class:`VideoSpec`。
+    ``swapped=True`` 时候选解排在前面，用于检验位置偏差（order consistency）。
 
-    对比锚点固定取**历史最佳解**而非紧邻上一轮：若上一轮是被回滚的失败尝试，
-    以它作基准会让 VLM 评语的参照系与 LLM 的实际调参基底错位（workflow.md §4.2）。
+    两段均以中性的"动作 A / 动作 B"命名，**不告诉模型哪一段是历史最佳解**：
+    实测表明告知身份会诱发锚定效应（候选解的分数逐项复制锚点的分数）。
+    锚点的历史得分仍会给出（workflow.md §4.2 要求），但只作量表校准用。
     """
     spec = grid or GridSpec()
     n_items = 2 * spec.items_per_motion
     anchor = ""
     if best is not None:
-        anchor = (f"\n作为对比锚点，历史最佳解在其对应轮次（第 {best.round_index} 轮）"
-                  f"获得的完整评分为：\n{_fmt_score(best.score)}\n"
-                  f"若本轮候选解确实更好，其分数不应低于上述分数；"
-                  f"若更差，请如实给出更低的分数。请避免一律给出中庸评价。\n")
+        tag = "B" if swapped else "A"
+        anchor = (f"\n供量表校准：动作 {tag} 在先前的评估中曾获得如下分数，"
+                  f"请以它作为理解各分档尺度的参照，"
+                  f"**不要把它当作本次应该给出的答案**：\n{_fmt_score(best.score)}\n")
     return f"""以下是同一个"负重行走"任务的 {n_items} {spec.media_noun}。
 
 【素材组织规则】
-{spec.layout_block()}
+{spec.layout_block(swapped)}
 
 【任务上下文】
 任务目标：使动作看起来像是端着 {target_weight_kg:g}kg 的托盘行走。该目标全程不变。
