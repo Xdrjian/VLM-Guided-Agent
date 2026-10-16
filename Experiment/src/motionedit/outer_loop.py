@@ -216,11 +216,11 @@ class OuterLoop:
             artifacts=self._artifacts(render, solved),
         )
         rec.artifacts["vlm_calls"] = str(len(resps))
-        if score is not None and best is not None:
-            bad = score.check_consistency(best.score)
+        if score is not None:
+            bad = score.check_consistency()
             if bad:
-                # 不自动修正分数：那会把模型的矛盾藏起来。只记录，交由人工判断
-                rec.warnings.extend(f"VLM 对比判定与分数矛盾：{b}" for b in bad)
+                # 不自动修正：那会把模型的矛盾藏起来。只记录，交由人工判断
+                rec.warnings.extend(f"VLM 判定与幅度矛盾：{b}" for b in bad)
         return rec
 
     # -------------------------------------------------------------- 子步 -- #
