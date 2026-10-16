@@ -38,6 +38,11 @@ from .params import GaitParams
 
 __all__ = [
     "SCORE_RANGES",
+    "SCORE_FIELDS",
+    "EFFORT_FIELDS",
+    "COMPARISON_VERDICTS",
+    "MAGNITUDE_LEVELS",
+    "MAGNITUDE_VALUE",
     "DEFAULT_SCORE_WEIGHTS",
     "VLMScore",
     "RawResponse",
@@ -68,8 +73,21 @@ DEFAULT_SCORE_WEIGHTS: Dict[str, float] = {
 
 SCORE_FIELDS = tuple(SCORE_RANGES.keys())
 
-#: ``comparison`` 字段的合法取值
-COMPARISON_VERDICTS = ("better", "worse", "same")
+#: 效力（Effort）四维。自然度不在其中——它已改为门槛而非奖励，见 :func:`pairwise_delta`
+EFFORT_FIELDS = ("weight", "time", "space", "flow")
+
+#: 对比判定的合法取值。用**位置**（first/second）而非 better/worse：
+#: 前者不预设哪一段是被考察对象，且交换提交顺序即可测位置偏差。
+#: ``insufficient`` 是必须存在的选项：不给"看不清"的出口，模型会被迫编一个答案。
+COMPARISON_VERDICTS = ("first", "second", "tie", "insufficient")
+
+#: 差异幅度。有幅度才能区分"勉强看得出"与"一目了然"，
+#: 而 1-5 绝对分在实测中会整体塌缩到中值 3。
+MAGNITUDE_LEVELS = ("none", "slight", "clear", "large")
+
+#: 幅度词 → 数值。用于外置计算配对得分，不让模型自己做算术
+MAGNITUDE_VALUE: Dict[str, float] = {
+    "none": 0.0, "slight": 1.0, "clear": 2.0, "large": 3.0}
 
 
 # --------------------------------------------------------------------------- #
@@ -87,10 +105,10 @@ class VLMScore:
     flow: int
     naturalness: int
     comments: Dict[str, str] = field(default_factory=dict)
-    #: 逐维度的"相比历史最佳解更好/更差/无差异"判定。
-    #: 首次实测发现模型会在评语里描述出递进差异（无→略有→一定），
-    #: 分数却死死压在量程正中的 3 分。强制它先表态再给分，并在代码里校验二者一致。
+    #: 逐维度的位置化判定：哪一段更好（first/second/tie/insufficient）
     comparison: Dict[str, str] = field(default_factory=dict)
+    #: 逐维度的差异幅度（none/slight/clear/large）
+    magnitude: Dict[str, str] = field(default_factory=dict)
 
     # ------------------------------------------------------------------ #
     def scores(self) -> Dict[str, int]:
@@ -106,29 +124,56 @@ class VLMScore:
         for k, verdict in self.comparison.items():
             if verdict not in COMPARISON_VERDICTS:
                 problems.append(f"comparison.{k}={verdict!r} 不在 {COMPARISON_VERDICTS}")
+        for k, mag in self.magnitude.items():
+            if mag not in MAGNITUDE_LEVELS:
+                problems.append(f"magnitude.{k}={mag!r} 不在 {MAGNITUDE_LEVELS}")
         return problems
 
-    def check_consistency(self, anchor: Optional["VLMScore"]) -> List[str]:
-        """校验对比判定与分数是否矛盾。
+    def check_consistency(self, anchor: Optional["VLMScore"] = None) -> List[str]:
+        """校验判定与幅度是否自洽。
 
-        “评语说有改善、分数却不变”是本项目实测到的具体失效模式；
-        没有这项校验，它不会报错，只会让收敛判断失去信号。
+        “说有差异却给幅度 none”、“说打平却给幅度 large”都不会报错，
+        只会让配对得分泄露噪声，故必须显式检查。``anchor`` 保留仅为兼容调用方。
         """
-        if anchor is None or not self.comparison:
-            return []
         out: List[str] = []
         for k in SCORE_FIELDS:
-            verdict = self.comparison.get(k)
-            if verdict is None:
+            v = self.comparison.get(k)
+            m = self.magnitude.get(k)
+            if v is None or m is None:
                 continue
-            mine, theirs = int(getattr(self, k)), int(getattr(anchor, k))
-            if verdict == "better" and mine <= theirs:
-                out.append(f"{k}: 判为 better 但分数 {mine} 不高于锚点 {theirs}")
-            elif verdict == "worse" and mine >= theirs:
-                out.append(f"{k}: 判为 worse 但分数 {mine} 不低于锚点 {theirs}")
-            elif verdict == "same" and mine != theirs:
-                out.append(f"{k}: 判为 same 但分数 {mine} ≠ 锚点 {theirs}")
+            if v in ("tie", "insufficient") and m != "none":
+                out.append(f"{k}: 判为 {v} 但幅度为 {m}")
+            elif v in ("first", "second") and m == "none":
+                out.append(f"{k}: 判为 {v} 但幅度为 none")
         return out
+
+    def pairwise_delta(self, candidate_is_second: bool = True,
+                       weights: Optional[Dict[str, float]] = None) -> Optional[float]:
+        """配对增量得分：候选解相对锚点的加权优劣，范围 [-1, 1]。
+
+        **仅统计 Effort 四维**；自然度不入奖励，改做门槛（见 ``history``）。
+        理由：实测自然度只会给"被编辑过的动作"扣分，而它占一半权重，
+        结果是任何改动都必然输给 A_ref，循环结构上无法接受任何解。
+
+        ``candidate_is_second``：候选解是否在第二个位置（位置偏差探针会交换）。
+        返回 ``None`` 表示没有配对信息，调用方应回退到绝对分。
+        """
+        if not self.comparison:
+            return None
+        w = weights or DEFAULT_SCORE_WEIGHTS
+        num = den = 0.0
+        for k in EFFORT_FIELDS:
+            v = self.comparison.get(k)
+            if v is None:
+                continue
+            wk = float(w.get(k, 0.0))
+            den += wk * MAGNITUDE_VALUE["large"]
+            if v in ("tie", "insufficient"):
+                continue
+            mag = MAGNITUDE_VALUE.get(self.magnitude.get(k, "none"), 0.0)
+            favored_candidate = (v == "second") == candidate_is_second
+            num += wk * mag * (1.0 if favored_candidate else -1.0)
+        return num / den if den > 0 else None
 
     def normalized(self) -> Dict[str, float]:
         """把各维度线性归一化到 [0, 1]，消除 1-5 与 1-10 分档的量纲差异。"""
@@ -151,24 +196,33 @@ class VLMScore:
         d["comments"] = dict(self.comments)
         if self.comparison:
             d["comparison"] = dict(self.comparison)
+        if self.magnitude:
+            d["magnitude"] = dict(self.magnitude)
         return d
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "VLMScore":
-        """从 VLM 返回的 JSON 构造，容忍多余字段与字符串型数字。"""
+        """从 VLM 返回的 JSON 构造，容忍多余字段与字符串型数字。
+
+        证据字段在 prompt 里叫 ``observations``（要求先写证据再打分），
+        内部仍存为 ``comments``；两个键名都接受。
+        """
         vals = {}
         for k in SCORE_FIELDS:
             if k not in d:
                 raise KeyError(f"VLM 返回缺少必需字段 '{k}'：{sorted(d.keys())}")
             vals[k] = int(round(float(d[k])))
-        comments = d.get("comments") or {}
+
+        def _strmap(key: str) -> Dict[str, str]:
+            v = d.get(key) or {}
+            return {str(a): str(b) for a, b in v.items()} if isinstance(v, dict) else {}
+
+        comments = d.get("observations") or d.get("comments") or {}
         if not isinstance(comments, dict):
             comments = {"_raw": str(comments)}
-        comp = d.get("comparison") or {}
-        if not isinstance(comp, dict):
-            comp = {}
         return cls(comments={str(k): str(v) for k, v in comments.items()},
-                   comparison={str(k): str(v) for k, v in comp.items()}, **vals)
+                   comparison=_strmap("comparison"),
+                   magnitude=_strmap("magnitude"), **vals)
 
     def summary(self) -> str:
         s = self.scores()
