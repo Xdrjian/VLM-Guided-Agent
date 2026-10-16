@@ -151,8 +151,10 @@ class _ApiBase:
 
     kind = "api"
 
+    #: 思考模型的 thought token 与正文**共享** max_output_tokens。实测 13 个正文
+    #: token 会配 488 个思考 token，预算给小了会让 JSON 从中间断掉。故留足余量。
     def __init__(self, model: str, temperature: float = 0.0,
-                 seed: Optional[int] = 0, max_tokens: int = 2048,
+                 seed: Optional[int] = 0, max_tokens: int = 8192,
                  max_retries: int = 2, extra: Optional[Dict[str, Any]] = None):
         self._assert_pinned(model)
         self.name = model
@@ -247,13 +249,14 @@ class _GeminiBase(_ApiBase):
     def __init__(self, model: str, *, video_fps: float = GEMINI_VIDEO_FPS,
                  json_mode: bool = True, delete_uploads: bool = True,
                  upload_timeout_s: float = 300.0, retry_backoff_s: float = 4.0,
-                 **kw: Any) -> None:
+                 max_token_ceiling: int = 32768, **kw: Any) -> None:
         super().__init__(model, **kw)
         self.video_fps = float(video_fps)
         self.json_mode = bool(json_mode)
         self.delete_uploads = bool(delete_uploads)
         self.upload_timeout_s = float(upload_timeout_s)
         self.retry_backoff_s = float(retry_backoff_s)
+        self.max_token_ceiling = int(max_token_ceiling)
         self._client: Any = None
         self._uploads: List[Dict[str, Any]] = []
 
@@ -333,20 +336,36 @@ class _GeminiBase(_ApiBase):
         if self.json_mode:
             cfg_kw["response_mime_type"] = "application/json"
 
+        budget = self.max_tokens
         last: Optional[Exception] = None
         try:
             contents = self._parts(media) + [user]
             for attempt in range(self.max_retries + 1):
+                cfg_kw["max_output_tokens"] = budget
                 try:
                     resp = self._sdk().models.generate_content(
                         model=self.model, contents=contents,
                         config=types.GenerateContentConfig(**cfg_kw))
-                    return self._to_body(resp)
+                    body = self._to_body(resp)
                 except Exception as e:                  # noqa: BLE001
                     last = e
                     if attempt >= self.max_retries:
                         break
                     time.sleep(self.retry_backoff_s * (2 ** attempt))
+                    continue
+                body["max_output_tokens"] = budget
+                if "MAX_TOKENS" not in str(body.get("finish_reason", "")).upper():
+                    return body
+                # 预算耗尽时正文会从中间断掉。若不在此识别，下游只会看到一个
+                # 莫名其妙的「JSON 对象未闭合」，把配置问题误判成模型能力问题。
+                u = body.get("usage", {})
+                last = RuntimeError(
+                    f"输出在 max_output_tokens={budget} 处被截断（思考 "
+                    f"{u.get('thought_tokens')} + 正文 {u.get('output_tokens')} token）；"
+                    f"思考 token 与正文共享同一预算，请调大 max_tokens")
+                if budget >= self.max_token_ceiling:
+                    break
+                budget = min(budget * 2, self.max_token_ceiling)
         finally:
             self._cleanup()
         raise RuntimeError(f"Gemini 调用失败（已重试 {self.max_retries} 次）：{last}") from last
@@ -359,8 +378,12 @@ class _GeminiBase(_ApiBase):
         except Exception:                               # noqa: BLE001
             dumped = str(resp)
         cand = (getattr(resp, "candidates", None) or [None])[0]
+        try:                                            # 预算耗尽时可能没有正文部件
+            text = resp.text or ""
+        except Exception:                               # noqa: BLE001
+            text = ""
         return {
-            "text": getattr(resp, "text", "") or "",
+            "text": text,
             "model": getattr(resp, "model_version", "") or self.model,
             "response_id": getattr(resp, "response_id", None),
             "finish_reason": str(getattr(cand, "finish_reason", "")) if cand else "",
