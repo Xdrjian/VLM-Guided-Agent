@@ -81,7 +81,8 @@ _ANGLE_DEF = """【膝关节角度的定义】
 通常出现在摆动相小腿折起、或支撑期下蹲缓冲的时刻。"""
 
 _RULES = """【观测纪律】
-1. 先在 ``observations`` 写明你是从**哪个机位、哪个时间段**读到峰值的，再给数值。
+1. 先在 ``observations`` 写明你是从**哪个机位、哪个时间段**读到峰值的，再给数值；
+   一句话写完，不超过 40 字。
 2. 若因视角、遮挡或分辨率无法读出，``observations`` 写 ``insufficient_visibility``，
    并把对应的数值字段填 ``null``。**这是正当结果，不是失败。**
 3. 不要为了给出答案而猜测；也不要因为两段看起来相似就默认它们相同。
@@ -173,9 +174,13 @@ class Probe:
         try:
             resp = cli.call(SYSTEM, prompt, videos)
             rec["raw"], rec["usage"] = resp.text, resp.usage
+            rec["finish_reason"] = (resp.body or {}).get("finish_reason")
+            rec["max_output_tokens"] = (resp.body or {}).get("max_output_tokens")
             rec["data"] = extract_json(resp.text)
         except Exception as e:                           # noqa: BLE001
             rec["error"] = f"{type(e).__name__}: {e}"
+            tag = " | ".join(Path(v).parent.name for v in videos)
+            print(f"    [调用失败] {tag} seed={seed}  {rec['error'][:150]}")
         self.log.append(rec)
         (self.out / "raw_calls.json").write_text(
             json.dumps(self.log, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -308,7 +313,8 @@ def main() -> int:
     ap.add_argument("--repeats", type=int, default=2)
     ap.add_argument("--model", default="gemini-3.8-flash")
     ap.add_argument("--temperature", type=float, default=0.0)
-    ap.add_argument("--max-tokens", type=int, default=1024)
+    # 思考 token 与正文共享这个预算，给小了 JSON 会从中间断掉。
+    ap.add_argument("--max-tokens", type=int, default=8192)
     ap.add_argument("--max-retries", type=int, default=2)
     ap.add_argument("--fps", type=float, default=GEMINI_VIDEO_FPS)
     ap.add_argument("--show-prompt", action="store_true")
@@ -360,8 +366,11 @@ def main() -> int:
               f"系统偏置 {s['bias']:+.1f}°，单调性 {'是' if s['monotonic'] else '否'}")
         print("  注：绝对准确度不是必需的——闭环只需要**相对排序**可靠。")
     tok = sum(r.get("usage", {}).get("total_tokens") or 0 for r in p.log)
-    errs = sum(1 for r in p.log if "error" in r)
-    print(f"\n  共 {len(p.log)} 次调用，{errs} 次失败，约 {tok} tokens")
+    bad = [r for r in p.log if "error" in r]
+    print(f"\n  共 {len(p.log)} 次调用，{len(bad)} 次失败，约 {tok} tokens")
+    for r in bad:
+        tag = " | ".join(Path(v).parent.name for v in r["videos"])
+        print(f"    失败 {tag} seed={r['seed']}：{r['error'][:150]}")
     (out / "report.json").write_text(
         json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"  结果：{out}")
