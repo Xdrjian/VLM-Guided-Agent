@@ -393,6 +393,23 @@ def test_clients(tmp: Path):
         check("API 适配层未实现时明确报错", True)
 
 
+def _stub_genai():
+    """本机没装 google-genai，用最小桩让 _invoke 的控制流能跑起来。"""
+    import types as _t
+    if "google.genai.types" in sys.modules:
+        return
+    gt = _t.ModuleType("google.genai.types")
+    gt.GenerateContentConfig = type(          # type: ignore[attr-defined]
+        "GenerateContentConfig", (),
+        {"__init__": lambda s, **kw: s.__dict__.update(kw)})
+    gg = _t.ModuleType("google.genai")
+    gg.types = gt                             # type: ignore[attr-defined]
+    g = _t.ModuleType("google")
+    g.genai = gg                              # type: ignore[attr-defined]
+    sys.modules.update({"google": g, "google.genai": gg,
+                        "google.genai.types": gt})
+
+
 def test_gemini_client():
     """Gemini 适配层的离线部分。真正的调用只能在有 API Key 的 Linux 机上跑，
     但响应体解析可以用探针实测到的真实字段形状做回归。"""
@@ -451,6 +468,45 @@ def test_gemini_client():
     class _NoUsage:
         text = "x"
     check("缺字段时不崩", cli._to_body(_NoUsage())["usage"] == {})
+
+    # 思考 token 与正文共享 max_output_tokens。预算给小了，JSON 会从中间断掉，
+    # 下游只看到「JSON 对象未闭合」——会把配置错误误判成模型能力不足。
+    check("默认输出预算为思考留足余量",
+          GeminiVLMClient("gemini-3.8-flash").max_tokens >= 8192)
+
+    _stub_genai()
+
+    class _Trunc(_Resp):
+        text = '{"observations": {"A": "在正侧面约 00:02.'
+        candidates = [type("C", (), {"finish_reason": "FinishReason.MAX_TOKENS"})()]
+
+    seen: list = []
+
+    class _Models:
+        def generate_content(self, *, model, contents, config):
+            seen.append(config.max_output_tokens)
+            return _Resp() if config.max_output_tokens >= 4096 else _Trunc()
+
+    c2 = GeminiVLMClient("gemini-3.8-flash", max_tokens=1024, max_retries=2)
+    c2._sdk = lambda: type("S", (), {"models": _Models()})()
+    c2._parts = lambda m: []
+    c2._cleanup = lambda: None
+    out = c2.call("s", "u", [])
+    check("截断后自动加倍预算重试直到写完", seen == [1024, 2048, 4096], str(seen))
+    check("重试成功后拿到完整正文", out.text == '{"weight": 3}')
+
+    seen.clear()
+    c3 = GeminiVLMClient("gemini-3.8-flash", max_tokens=1024, max_retries=2,
+                         max_token_ceiling=2048)
+    c3._sdk = c2._sdk
+    c3._parts = lambda m: []
+    c3._cleanup = lambda: None
+    try:
+        c3.call("s", "u", [])
+        check("加满预算仍截断时必须报错", False)
+    except RuntimeError as e:
+        check("报错点名截断而非 JSON 解析失败",
+              "截断" in str(e) and "max_output_tokens" in str(e), str(e)[:120])
 
 
 # --------------------------------------------------------------------------- #
