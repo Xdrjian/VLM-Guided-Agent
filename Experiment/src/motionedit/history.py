@@ -56,7 +56,14 @@ class TerminationConfig:
     #: 新解需超过历史最佳多少才算"提升"。设为 0 即严格大于；
     #: 噪声摸底后应设为略大于噪声标准差，避免把噪声当改进
     improvement_margin: float = 0.0
-
+    #: 自然度作为**门槛**而非奖励：低于此值即拒绝，高于此值不额外加分。
+    #: 实测表明自然度只会给"被编辑过的动作"扣分，而它原本占一半权重，
+    #: 结果是任何改动都必然输给 A_ref。改做门槛后，它只阻止退化、不抑制改进。
+    #: 与 workflow.md §4.2（自然度权重 = Effort 四项之和）不同，已在报告中标出。
+    naturalness_floor: int = 6
+    #: 有配对判定时，是否用配对增量而非绝对总分做接受判定。
+    #: 配对判定来自同一次调用，不受跨调用的绝对分漂移影响
+    use_pairwise: bool = True
 
 # --------------------------------------------------------------------------- #
 class History:
@@ -131,7 +138,20 @@ class History:
             record.accepted = True
             self._best_index = record.round_index
             self._stall = 0
-        elif record.total_score > best.total_score + self.cfg.improvement_margin:
+            return record
+
+        # 自然度是门槛不是奖励：退化到底线以下直接拒绝，不参与加权比较
+        if int(record.score.naturalness) < self.cfg.naturalness_floor:
+            record.accepted = False
+            record.rolled_back = True
+            record.warnings.append(
+                f"自然度 {record.score.naturalness} 低于门槛 "
+                f"{self.cfg.naturalness_floor}，本轮直接回滚")
+            self._stall += 1
+            return record
+
+        gain = self._gain(record, best)
+        if gain > self.cfg.improvement_margin:
             record.accepted = True
             self._best_index = record.round_index
             self._stall = 0
@@ -140,6 +160,18 @@ class History:
             record.rolled_back = True
             self._stall += 1
         return record
+
+    def _gain(self, record: RoundRecord, best: RoundRecord) -> float:
+        """本轮相对历史最佳的增益。
+
+        优先用**同一次调用内**给出的配对判定：跨调用的绝对分会整体漂移，
+        而配对判定只问"这两段谁更好"，不受漂移影响。无配对信息时回退到总分差。
+        """
+        if self.cfg.use_pairwise and record.score is not None:
+            delta = record.score.pairwise_delta()
+            if delta is not None:
+                return delta
+        return record.total_score - best.total_score
 
     # ------------------------------------------------------ 终止与健康 -- #
     def check_reference_health(self) -> List[str]:
