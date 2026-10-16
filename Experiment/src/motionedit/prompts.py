@@ -349,11 +349,14 @@ _VLM_OUTPUT_FORMAT_PAIR = """请严格以如下 JSON 格式输出（不要添加
 def render_vlm_prompt(round_index: int, target_weight_kg: float,
                       best: Optional[RoundRecord],
                       grid: Optional[Any] = None,
-                      swapped: bool = False) -> str:
+                      swapped: bool = False,
+                      paired: Optional[bool] = None) -> str:
     """常规轮次的 VLM prompt（两段同场对比）。
 
     ``grid`` 接受 :class:`GridSpec` 或 :class:`VideoSpec`。
     ``swapped=True`` 时候选解排在前面，用于检验位置偏差（order consistency）。
+    ``paired`` 显式指定是否用配对输出格式；``None`` 时按有无 ``best`` 自动判断。
+    判官性质测试需要"配对格式 + 不给锚点分数"，否则锚点分数本身是混淆因素。
 
     两段均以中性的"动作 A / 动作 B"命名，**不告诉模型哪一段是历史最佳解**：
     实测表明告知身份会诱发锚定效应（候选解的分数逐项复制锚点的分数）。
@@ -361,8 +364,9 @@ def render_vlm_prompt(round_index: int, target_weight_kg: float,
     """
     spec = grid or GridSpec()
     n_items = 2 * spec.items_per_motion
+    use_pair = (best is not None) if paired is None else bool(paired)
     anchor = ""
-    if best is not None:
+    if best is not None and best.score is not None:
         tag = "B" if swapped else "A"
         anchor = (f"\n供量表校准：动作 {tag} 在先前的评估中曾获得如下分数，"
                   f"请以它作为理解各分档尺度的参照，"
@@ -379,7 +383,7 @@ def render_vlm_prompt(round_index: int, target_weight_kg: float,
 {_SCORING_RULES}
 
 【输出格式】
-{_VLM_OUTPUT_FORMAT_PAIR if best is not None else _VLM_OUTPUT_FORMAT}
+{_VLM_OUTPUT_FORMAT_PAIR if use_pair else _VLM_OUTPUT_FORMAT}
 """
 
 
