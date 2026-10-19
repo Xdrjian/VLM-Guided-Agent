@@ -1,0 +1,11 @@
+# Local generated Experiment outputs
+Experiment/probe/
+Experiment/renders/
+Experiment/runs/
+Experiment/solved/
+
+# pipeline-local generated outputs
+Experiment/pipeline/probe/
+Experiment/pipeline/renders/
+Experiment/pipeline/runs/
+Experiment/pipeline/solved/
