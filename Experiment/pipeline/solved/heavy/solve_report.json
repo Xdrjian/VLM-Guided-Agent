@@ -9,28 +9,31 @@
     "tray_chest_distance_scale": 0.85
   },
   "target": {
-    "num_frames": 83,
-    "src_idx_range": "0.0..73.8",
-    "knee_flex_left": "20.4..123.4",
-    "knee_flex_right": "24.0..120.6",
+    "num_frames": 92,
+    "src_idx_range": "0.0..81.9",
+    "knee_flex_left": "20.4..123.5",
+    "knee_flex_right": "24.0..121.2",
     "trunk_lean": "15.9..20.5",
-    "elbow_flex_left": "75.4..79.5",
-    "root_travel_m": 1.5723,
+    "elbow_flex_left": "75.3..79.5",
+    "root_travel_m": 1.7654,
     "tray_chest_distance": 0.3595,
-    "notes": []
+    "notes": [
+      "步频缩放 0.90 → 输出 92 帧（参考 83 帧）"
+    ]
   },
   "solve": {
-    "elapsed_s": 74.75,
+    "elapsed_s": 28.59,
     "converged": true,
-    "task": "555.39 -> 44.37",
-    "prior": "-0.0000 -> 0.0041",
+    "task": "563.97 -> 27.96",
+    "prior": "-0.0000 -> 0.0049",
     "rom": "0.0000 -> 0.0000",
-    "smooth": "6.89e-05 -> 2.62e-05",
-    "contact": "2.38e-05 -> 9.50e-06",
+    "smooth": "8.97e-05 -> 2.08e-05",
+    "contact": "2.13e-05 -> 8.53e-06",
     "notes": [
+      "步频缩放 0.90 → 输出 92 帧（参考 83 帧）",
       "已启用时间映射暖启动",
       "权重已按初始点自动定标",
-      "增量幅度 {'max_rot_deg': 43.50220489501953, 'mean_rot_deg': 5.548100471496582, 'max_root_shift_m': 0.03639243543148041}"
+      "增量幅度 {'max_rot_deg': 26.637916564941406, 'mean_rot_deg': 6.4108171463012695, 'max_root_shift_m': 0.05168405547738075}"
     ]
   },
   "ref_features": {
@@ -53,22 +56,22 @@
     "phase_valid": true
   },
   "new_features": {
-    "num_frames": 83,
-    "duration_s": 3.4583,
+    "num_frames": 92,
+    "duration_s": 3.8333,
     "cadence_steps_per_s": 1.2632,
     "cycle_frames": 38.0,
-    "stride_length_m": 0.9224,
-    "double_support_ratio": 0.3253,
-    "knee_flex_left_mean": 59.941,
-    "knee_flex_left_max": 122.741,
-    "knee_flex_right_mean": 60.937,
-    "knee_flex_right_max": 120.478,
-    "trunk_lean_mean": 18.643,
-    "trunk_lean_max": 20.792,
-    "elbow_flex_left_mean": 77.191,
-    "elbow_flex_right_mean": 65.081,
-    "com_vertical_range_m": 0.1296,
-    "tray_chest_distance_mean": 0.3559,
+    "stride_length_m": 0.931,
+    "double_support_ratio": 0.3043,
+    "knee_flex_left_mean": 62.807,
+    "knee_flex_left_max": 123.141,
+    "knee_flex_right_mean": 61.889,
+    "knee_flex_right_max": 120.94,
+    "trunk_lean_mean": 18.659,
+    "trunk_lean_max": 20.735,
+    "elbow_flex_left_mean": 77.288,
+    "elbow_flex_right_mean": 65.85,
+    "com_vertical_range_m": 0.131,
+    "tray_chest_distance_mean": 0.3616,
     "phase_valid": true
   }
 }

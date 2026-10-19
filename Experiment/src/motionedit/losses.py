@@ -116,7 +116,7 @@ class LossWeights:
     w_root: float = 300.0          # 位置项（米²）→ 角度项（度²）的量纲换算
 
     # --- 三个正则项的基准权重 ---
-    w_prior: float = 1.0
+    w_prior: float = 3.0
     w_rom: float = 1.0
     w_smooth: float = 1.0
     w_contact: float = 1.0
@@ -139,7 +139,7 @@ class LossWeights:
     contact_drift: float = 0.5
 
     # --- 退火（k 为当前迭代占总迭代的比例 ∈ [0,1]） ---
-    prior_decay: float = 0.1       # w_prior(k) = w_prior · decay^k
+    prior_decay: float = 0.95       # w_prior(k) = w_prior · decay^k
     rom_growth: float = 20.0       # w_rom(k)   = w_rom   · growth^k
 
     def at(self, k: float) -> "LossWeights":

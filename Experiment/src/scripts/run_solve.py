@@ -58,6 +58,10 @@ PRESETS = {
         knee_flex_scale=1.40, trunk_lean_offset=15.0, cadence_scale=0.80,
         double_support_offset=0.12, stride_length_scale=0.65,
         elbow_flex_offset=18.0, tray_chest_distance_scale=0.75),
+    "improve":GaitParams(
+        knee_flex_scale=0.95, trunk_lean_offset=6.0, cadence_scale=0.70,
+        double_support_offset=0.2, stride_length_scale=0.8,
+        elbow_flex_offset=10.0, tray_chest_distance_scale=0.70),
 }
 
 

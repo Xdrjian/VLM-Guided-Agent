@@ -62,73 +62,85 @@ SKEL = REPO / "humoto/human_model/human_model_up_bone_zup.json"
 ITEMS = ["knee_low", "knee_mid", "knee_high"]
 
 SYSTEM = (
-    "你是一位人体运动学观测员。你的任务是从渲染视频中读出指定关节的角度。\n"
-    "你只输出一个 JSON 对象，不要输出任何解释性前后文。"
+    "You are a human motion analysis observer. Your task is to estimate the joint angle from the rendered video.\n"
+    "You must output exactly one JSON object and nothing else."
 )
 
-#: 角度的操作性定义。不给定义就无法比对：实测模型默认用「大腿与小腿的夹角」，
-#: 而我们的特征提取用的是「屈曲角」，二者互补（相加为 180°）。
-_ANGLE_DEF = """【膝关节角度的定义】
-对同一时刻的同一条腿，有两个互补的读数，请**两个都给出**：
-- ``included_angle_deg``：大腿与小腿之间的夹角。腿完全伸直时为 180°，
-  蹲到小腿贴紧大腿时趋近 0°。
-- ``flexion_deg``：屈曲角。腿完全伸直时为 0°，折叠越多该值越大。
-两者满足 ``flexion_deg = 180 − included_angle_deg``。若你给出的两个数不满足
-这个关系，说明读数有误，请自行复核后再输出。
+#: Operational definition of the angle. Without this definition it is not comparable: the model usually reads the
+#: included angle between thigh and shank, while our feature extraction uses flexion angle = 180° - included angle.
+_ANGLE_DEF = """[Knee angle definition]
+For the same time instant and the same leg, there are two complementary readings; provide both:
+- ``included_angle_deg``: angle between the thigh and shank. When the leg is fully extended, this is 180°; when the knee is heavily bent and the shank folds toward the thigh, it approaches 0°.
+- ``flexion_deg``: flexion angle. When the leg is fully extended, this is 0°; the more the knee folds, the larger this value becomes.
+The relationship is ``flexion_deg = 180 - included_angle_deg``. If the two numbers you provide do not satisfy this relationship, your reading is wrong; recheck before outputting.
 
-【要测的量】
-整段视频中**屈曲最深的那一瞬间**的读数（左右腿取更深的一条，不必区分左右）。
-通常出现在摆动相小腿折起、或支撑期下蹲缓冲的时刻。"""
+[What to measure]
+Use the moment in the full video where the knee is most flexed (peak flexion), using the deeper of the left/right knee if needed, without distinguishing left and right.
+This usually occurs during the swing phase when the shank folds up, or during the support phase when the knee buffers the landing.
+"""
 
-_RULES = """【观测纪律】
-1. 先在 ``observations`` 写明你是从**哪个机位、哪个时间段**读到峰值的，再给数值；
-   一句话写完，不超过 40 字。
-2. 若因视角、遮挡或分辨率无法读出，``observations`` 写 ``insufficient_visibility``，
-   并把对应的数值字段填 ``null``。**这是正当结果，不是失败。**
-3. 不要为了给出答案而猜测；也不要因为两段看起来相似就默认它们相同。
-4. 画面是无贴图素模，这是实验设定，与读数无关。
-每段视频把 3 个机位横向拼接在同一画面中，从左到右依次为：正侧面、正前方、45°斜前上方。
-矢状面（最左侧机位）通常最适合读膝角。"""
+_RULES = """[Observation rules]
+1. First state in ``observations`` which camera view and which time window you used to identify the peak value, then give the numbers. Keep it to a single sentence, under 40 characters if possible.
+2. If the view, occlusion, or resolution makes the measurement impossible, set ``observations`` to ``insufficient_visibility`` and fill the corresponding numeric fields with ``null``. This is a valid outcome, not a failure.
+3. Do not guess just to provide an answer, and do not assume two clips are the same just because they look similar.
+4. The render is a plain humanoid without textures; this is part of the experimental setup and should not affect the reading.
+Each clip is a stitched 3-view frame with side view, front view, and 45° front-up view from left to right. The sagittal view (leftmost camera) is usually the clearest for knee-angle measurement.
+"""
 
-PAIR_FORMAT = """请严格以如下 JSON 输出（按字段顺序填写，不要添加额外字段）：
-{"observations": {"A": str, "B": str},
- "included_angle_deg": {"A": number|null, "B": number|null},
- "flexion_deg": {"A": number|null, "B": number|null},
- "deeper": "A"|"B"|"tie"|"insufficient",
- "difference_deg": number|null,
- "confidence": "low"|"medium"|"high"}
+PAIR_FORMAT = """Strictly output JSON in the following format, with fields in this order and no extra fields:
+{
+  "peak_observation_A": {
+    "view": "side"|"front"|"diag"|str,
+    "time_range": "...",
+    "evidence": "..."
+  },
+  "peak_observation_B": {
+    "view": "side"|"front"|"diag"|str,
+    "time_range": "...",
+    "evidence": "..."
+  },
+  "deeper": "A"|"B"|"tie"|"insufficient",
+  "difference": "none"|"slight"|"clear"|"large",
+  "confidence": "low"|"medium"|"high"
+}
 
-``deeper`` 指屈曲更深（flexion_deg 更大）的那一段；两段读数相同写 ``tie``，
-无法判断写 ``insufficient``。``difference_deg`` 为两者屈曲角之差的绝对值。"""
+- ``peak_observation_A`` and ``peak_observation_B`` record the peak observation for each action.
+- ``view`` should indicate which camera view was used to observe the peak (for example side / front / diag).
+- ``time_range`` should indicate the time interval where the peak is observed, such as "00:02.250-00:02.333".
+- ``evidence`` should be a short sentence explaining why this is the peak.
+- ``deeper`` indicates which action is more flexed (larger flexion angle); if they are equal, use ``tie``; if the comparison is not possible, use ``insufficient``. **Note: It is virtually impossible for the result to be a ``tie``.**
+- ``difference`` describes the magnitude of the comparison: ``none`` = nearly identical, ``slight`` = small difference, ``clear`` = obvious difference, ``large`` = very large difference.
+"""
 
-SOLO_FORMAT = """请严格以如下 JSON 输出（按字段顺序填写，不要添加额外字段）：
+SOLO_FORMAT = """Strictly output JSON in the following format, with fields in this order and no extra fields:
 {"observations": str,
  "included_angle_deg": number|null,
  "flexion_deg": number|null,
- "confidence": "low"|"medium"|"high"}"""
+ "confidence": "low"|"medium"|"high"}
+"""
 
 
 def pair_prompt() -> str:
-    return f"""以下是两段渲染视频，第一段记为**动作 A**，第二段记为**动作 B**。
-两段均为待观测的动作，提交顺序不含任何暗示。
+    return f"""The following are two rendered videos. The first is labeled **Action A** and the second is **Action B**.
+Both are target actions to compare. The submission order contains no hidden cue.
 
 {_ANGLE_DEF}
 
 {_RULES}
 
-【输出格式】
+[Output format]
 {PAIR_FORMAT}
 """
 
 
 def solo_prompt() -> str:
-    return f"""以下是一段渲染视频。
+    return f"""The following is one rendered video.
 
 {_ANGLE_DEF}
 
 {_RULES}
 
-【输出格式】
+[Output format]
 {SOLO_FORMAT}
 """
 
@@ -256,16 +268,24 @@ def run_pair(p: Probe, mats: Dict[str, Path], gt: Dict[str, float],
             truth_win = x if gt[x] > gt[y] else y
             gt_diff = abs(gt[x] - gt[y])
             diff = _num(d.get("difference_deg"))
+            if diff is None:
+                diff = _num((d.get("difference") if isinstance(d.get("difference"), (int, float)) else None))
+            diff_level = str(d.get("difference", "?"))
+            obs_a = d.get("peak_observation_A") or {}
+            obs_b = d.get("peak_observation_B") or {}
             agree = (picked == truth_win) if picked else None
             results.append({"pair": [x, y], "order": [a, b], "repeat": k,
                             "picked": picked, "verdict": verdict,
                             "truth": truth_win, "agree": agree,
                             "model_diff": diff, "truth_diff": gt_diff,
+                            "difference": diff_level,
+                            "peak_observation_A": obs_a,
+                            "peak_observation_B": obs_b,
                             "confidence": d.get("confidence")})
             print(f"  {a + ' | ' + b:<26}{str(picked or verdict):<12}{truth_win:<12}"
                   f"{('对' if agree else ('错' if agree is False else '—')):<6}"
                   f"{(f'{diff:.0f}' if diff is not None else '-'):>9}{gt_diff:9.1f}"
-                  f"  {str(d.get('confidence', '?'))[:6]}")
+                  f"  {str(d.get('confidence', '?'))[:6]}  {diff_level}")
 
     decided = [r for r in results if r["picked"]]
     right = [r for r in decided if r["agree"]]
