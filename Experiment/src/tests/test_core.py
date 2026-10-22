@@ -403,7 +403,21 @@ def test_solver(seq, skel: Skeleton, feats, curves):
     # --- 端到端求解（迭代数压低以控制自测时长） --- #
     res = solve(seq, skel, target,
                 cfg=SolverConfig(adam_iters=120, lbfgs_iters=25, log_every=999))
-    check("求解正常结束", res.converged, f"{res.elapsed_s:.1f}s")
+    check("求解无硬性失败", not res.failed, f"{res.elapsed_s:.1f}s")
+    # converged 必须名副其实：这点迭代量远不足以到驻点，它就该报 False。
+    # 旧实现里该字段恒为 True（只在抛异常或 ROM 越界时才翻转），误导过一次排查。
+    check("迭代量不足时 converged 如实报 False", not res.converged,
+          str(res.notes[-2:]))
+    check("记录 Adam 实际用了多少次", res.adam_used == 120, str(res.adam_used))
+
+    # 停止判据：把阈值放宽到"每次检查必须再降 50%"，正常情况下立刻触发
+    early = solve(seq, skel, target, cfg=SolverConfig(
+        adam_iters=2000, lbfgs_iters=5, log_every=9999, anneal_frac=0.1,
+        converge_tol=0.5, converge_check_every=20, converge_patience=2))
+    check("任务项走平后提前停止", early.adam_used < 2000, str(early.adam_used))
+    check("提前停止写进 notes",
+          any("提前停止" in n for n in early.notes), str(early.notes))
+
     check("任务项大幅下降",
           res.final_terms["task"] < res.initial_terms["task"] * 0.25,
           f"{res.initial_terms['task']:.1f} -> {res.final_terms['task']:.1f}")
