@@ -74,8 +74,8 @@ def main() -> int:
     ap.add_argument("--motion", type=Path, default=DEFAULT_MOTION)
     ap.add_argument("--skeleton", type=Path, default=DEFAULT_SKEL)
     ap.add_argument("--out", type=Path, default=None, help="输出目录（不给则不落盘）")
-    ap.add_argument("--adam-iters", type=int, default=600)
-    ap.add_argument("--lbfgs-iters", type=int, default=60)
+    ap.add_argument("--adam-iters", type=int, default=SolverConfig.adam_iters)
+    ap.add_argument("--lbfgs-iters", type=int, default=SolverConfig.lbfgs_iters)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args()
 
@@ -156,7 +156,7 @@ def main() -> int:
         print(f"\n  已保存: {pkl}")
         print(f"  已保存: {args.out / 'solve_report.json'}")
 
-    return 0 if res.converged else 1
+    return 1 if res.failed else 0
 
 
 if __name__ == "__main__":
