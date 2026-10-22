@@ -55,6 +55,8 @@ class ExecCheckConfig:
     grip_tol: float = 5.0
     #: 托盘倾角 hinge 上限（度²）
     level_tol: float = 25.0
+    #: 欠收敛是否要记一笔。它不计为失效，但各轮收敛程度不一致会让
+    #: VLM 看到的差异里混入优化器运气，是个必须可追溯的混淆变量。
     require_converged: bool = True
 
 
@@ -230,15 +232,20 @@ class MotionSolveFn:
                     f"（相对误差 {row.rel_error * 100:.1f}% > {cfg.rel_tol * 100:.0f}%）")
 
         terms = res.final_terms
-        if cfg.require_converged and not res.converged:
-            violations.append("求解器未收敛")
+        notes = list(res.notes)
+        if getattr(res, "failed", False):
+            violations.append("求解器硬性失败（损失非有限 / L-BFGS 异常 / ROM 越界）")
+        elif cfg.require_converged and not res.converged:
+            # 欠收敛不是失效：结果仍可用，其实际后果已由 rel_tol 跟踪误差兑现。
+            # 但必须记下来：各轮收敛程度不一致会把优化器差异混进 VLM 的比较里。
+            notes.append("求解器未达驻点（仅提示，不计为失效）")
         for key, tol, label in (("rom", cfg.rom_tol, "ROM 越界"),
                                 ("grip", cfg.grip_tol, "抓握脱手"),
                                 ("level", cfg.level_tol, "托盘倾倒")):
             val = float(terms.get(key, 0.0))
             if val > tol:
                 violations.append(f"{label}：{key}={val:.4f} > {tol}")
-        return rows, violations, list(res.notes)
+        return rows, violations, notes
 
     @staticmethod
     def _llm_features(feats: GaitFeatures, rows: Dict[str, TrackingRow]
