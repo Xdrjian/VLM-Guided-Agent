@@ -117,8 +117,16 @@ def main() -> int:
     new_feats, _ = extract_features(out, skel, tray_name=TRAY)
 
     rows = [
+        ("左膝支撑相均值 (°)", ref_feats.knee_flex_left_stance_mean,
+         ref_feats.knee_flex_left_stance_mean * params.knee_flex_scale,
+         new_feats.knee_flex_left_stance_mean),
         ("左膝屈曲峰值 (°)", ref_feats.knee_flex_left_max,
          float(target.knee_flex_left.max()), new_feats.knee_flex_left_max),
+        ("左髋支撑相均值 (°)", ref_feats.hip_flex_left_stance_mean,
+         ref_feats.hip_flex_left_stance_mean + params.hip_flex_offset,
+         new_feats.hip_flex_left_stance_mean),
+        ("左髋屈曲峰值 (°)", ref_feats.hip_flex_left_max,
+         float(target.hip_flex_left.max()), new_feats.hip_flex_left_max),
         ("躯干前倾均值 (°)", ref_feats.trunk_lean_mean,
          float(target.trunk_lean.mean()), new_feats.trunk_lean_mean),
         ("左肘屈曲均值 (°)", ref_feats.elbow_flex_left_mean,
