@@ -69,6 +69,7 @@ solve(..., cfg=SolverConfig(calibrate_ratios={
 | 名称 | 默认 | 状态 | 说明 |
 |---|---|---|---|
 | `w_knee` | 1.0 | 🟡 | 膝屈曲 |
+| `w_hip` | 1.0 | 🟡 | 屈髋。**与膝同档**：髋膝必须联动才做得出下蹲，谁轻了都会被另一方压过去。加此项前实测：`knee_flex_scale=1.6` 下支撑相屈膝 +16.4° 而屈髋仅 +2.8°。 |
 | `w_trunk` | 1.0 | 🟡 | 躯干前倾 |
 | `w_elbow` | 0.5 | 🟡 | 肘屈曲。取一半是因为端托姿势下肘角本就变化很小，信息量低。 |
 | `w_root` | 300.0 | 🟡 | **量纲换算**：位置项单位是 m²，角度项是 deg²，两者差约两个量级。300 ≈ (17°/m)²，即"偏 1 米 ≈ 偏 17 度"。这个换算率是主观的，可调。 |
@@ -203,11 +204,12 @@ loss_fn = MotionLoss(..., dof_mask=skel.dof_mask(custom))
 
 ## 8. 参数边界 — `motionedit/params.py` 的 `PARAM_BOUNDS`
 
-LLM 输出的 7 个参数的合法区间（软裁剪）。状态 🟡，全部为经验值：
+LLM 输出的 8 个参数的合法区间（软裁剪）。状态 🟡，全部为经验值：
 
 | 参数 | 区间 |
 |---|---|
 | `knee_flex_scale` | 0.5 ~ 2.0 |
+| `hip_flex_offset` | −15 ~ +40° |
 | `trunk_lean_offset` | −15 ~ +40° |
 | `cadence_scale` | 0.5 ~ 1.8 |
 | `double_support_offset` | −0.10 ~ +0.25 |
