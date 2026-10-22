@@ -15,6 +15,7 @@
       knee_low/      ...  knee_flex_scale = 1.00（经求解器，渲染风格与其余一致）
       knee_mid/      ...  knee_flex_scale = 1.30
       knee_high/     ...  knee_flex_scale = 1.60
+      squat_high/    ...  knee=1.60 且 hip=+20°，与 knee_high 只差屈髋
       super_heavy/   ...  七参数全部推到较极端但合法的取值
       chaotic/       ...  人为注入关节噪声，故意不自然
       index.json     每份素材的参数、帧数、时长、实测特征
@@ -79,8 +80,13 @@ MATERIALS: List[Material] = [
              GaitParams(knee_flex_scale=1.30)),
     Material("knee_high", "单调性测试高档：knee_flex_scale=1.60",
              GaitParams(knee_flex_scale=1.60)),
-    Material("super_heavy", "七参数推到较极端但合法；预期有一定不自然",
-             GaitParams(knee_flex_scale=1.60, trunk_lean_offset=20.0,
+    # 与 knee_high 的差异只有屈髋：用来分辨判官是否能看出
+    # “真下蹲”和“只是小腿往后勾”的区别
+    Material("squat_high", "髋膝联动：knee=1.60 且 hip=+20°",
+             GaitParams(knee_flex_scale=1.60, hip_flex_offset=20.0)),
+    Material("super_heavy", "八参数推到较极端但合法；预期有一定不自然",
+             GaitParams(knee_flex_scale=1.60, hip_flex_offset=25.0,
+                        trunk_lean_offset=20.0,
                         cadence_scale=0.60, double_support_offset=0.20,
                         stride_length_scale=0.50, elbow_flex_offset=35.0,
                         tray_chest_distance_scale=0.55)),
