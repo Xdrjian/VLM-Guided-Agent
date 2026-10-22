@@ -123,8 +123,8 @@ def main() -> int:
                    help="第0轮自然度健康检查下限；实测动捕真值稳定得 7 分")
 
     g = ap.add_argument_group("求解器")
-    g.add_argument("--adam-iters", type=int, default=600)
-    g.add_argument("--lbfgs-iters", type=int, default=60)
+    g.add_argument("--adam-iters", type=int, default=SolverConfig.adam_iters)
+    g.add_argument("--lbfgs-iters", type=int, default=SolverConfig.lbfgs_iters)
     g.add_argument("--rel-tol", type=float, default=0.15,
                    help="指令跟踪的相对误差上限，超出即告警")
     g.add_argument("--max-consecutive-failures", type=int, default=2,
