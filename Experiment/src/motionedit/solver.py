@@ -53,10 +53,21 @@ __all__ = ["SolverConfig", "SolveResult", "PoseVariable", "solve"]
 class SolverConfig:
     """求解器超参数。"""
 
-    adam_iters: int = 600
+    adam_iters: int = 1500
     adam_lr: float = 0.01
     lbfgs_iters: int = 60
     lbfgs_lr: float = 0.5
+
+    #: 退火在前 ``anneal_frac`` 比例的迭代内完成，其后权重保持终值不变。
+    #: 必须与 ``adam_iters`` 解耦：否则提前停止会把退火卡在半路，
+    #: 而紧随的 L-BFGS 固定用终值权重，两个阶段优化的就不是同一个目标。
+    anneal_frac: float = 0.6
+
+    #: 收敛判据作用在 **task** 上，total 含退火中的 w_prior/w_rom，跨迭代
+    #: 不可比（实测 total 在 1426→1956→688 之间乱跳，而 task 单调下降）。
+    converge_tol: float = 1e-3
+    converge_patience: int = 3
+    converge_check_every: int = 50
 
     #: 单根骨骼相对参考的最大旋转量（度）。软性安全阀，防止优化器把某个关节
     #: "转出去再绕回来"得到数值上等价、视觉上崩坏的解。
@@ -92,7 +103,15 @@ class SolveResult:
     initial_terms: Dict[str, float] = field(default_factory=dict)
     weights: Optional[LossWeights] = None
     elapsed_s: float = 0.0
+    #: 解是否已到驻点。判据是“L-BFGS 也再推不动任务项”——光看 Adam 跑平
+    #: 不算数：实测 Adam 跑满 600 次后，60 次 L-BFGS 还能把 task.knee 从
+    #: 407 压到 174，那只是一阶方法在狭长山谷里迈不动，不是真的收敛。
     converged: bool = True
+    #: 硬性失败（损失非有限 / L-BFGS 抛异常 / ROM 越界）。与欠收敛是两回事：
+    #: 欠收敛只是没做到位，结果仍可用；硬性失败的输出不可用。
+    failed: bool = False
+    #: Adam 实际跑了多少次（提前停止时小于 adam_iters）
+    adam_used: int = 0
     notes: List[str] = field(default_factory=list)
 
     def summary(self) -> Dict[str, object]:
@@ -100,6 +119,8 @@ class SolveResult:
         return {
             "elapsed_s": round(self.elapsed_s, 2),
             "converged": self.converged,
+            "failed": self.failed,
+            "adam_used": self.adam_used,
             "task": f"{i.get('task', 0):.2f} -> {f.get('task', 0):.2f}",
             "prior": f"{i.get('prior', 0):.4f} -> {f.get('prior', 0):.4f}",
             "rom": f"{i.get('rom', 0):.4f} -> {f.get('rom', 0):.4f}",
@@ -260,8 +281,12 @@ def solve(
     # --- 阶段一：Adam + 权重退火 ---------------------------------------- #
     opt = torch.optim.Adam(var.parameters(), lr=cfg.adam_lr)
     clamped_total = 0
+    anneal_span = max(cfg.anneal_frac * (cfg.adam_iters - 1), 1.0)
+    prev_task: Optional[float] = None
+    stale = 0
+    adam_used = cfg.adam_iters
     for it in range(cfg.adam_iters):
-        progress = it / max(cfg.adam_iters - 1, 1)
+        progress = min(it / anneal_span, 1.0)
         opt.zero_grad(set_to_none=True)
         terms = loss_fn(var(), progress)
         terms.total.backward()
@@ -271,7 +296,8 @@ def solve(
             return SolveResult(
                 pose=var().detach(), history=history, initial_terms=initial,
                 final_terms=terms.to_dict(), weights=loss_fn.w,
-                elapsed_s=time.time() - t_start, converged=False, notes=notes)
+                elapsed_s=time.time() - t_start, converged=False, failed=True,
+                adam_used=it, notes=notes)
 
         torch.nn.utils.clip_grad_norm_(var.parameters(), cfg.grad_clip)
         opt.step()
@@ -280,8 +306,26 @@ def solve(
         if it % cfg.log_every == 0 or it == cfg.adam_iters - 1:
             record(it, terms, "adam")
 
+        # 退火未完成时目标函数还在变，谈不上停不停
+        if progress >= 1.0 and it % cfg.converge_check_every == 0:
+            cur = float(terms.task)
+            if prev_task is not None:
+                gain = (prev_task - cur) / max(abs(prev_task), 1e-12)
+                stale = stale + 1 if gain < cfg.converge_tol else 0
+                if stale >= cfg.converge_patience:
+                    adam_used = it + 1
+                    notes.append(
+                        f"Adam 在第 {it} 次提前停止：任务项连续 "
+                        f"{cfg.converge_patience} 次检查相对改善 < {cfg.converge_tol:g}")
+                    record(it, terms, "adam")
+                    break
+            prev_task = cur
+
     if clamped_total:
         notes.append(f"增量安全阀触发 {clamped_total} 次（参数可能过于激进）")
+
+    with torch.no_grad():
+        pre_lbfgs = float(loss_fn(var(), 1.0).task)
 
     # --- 阶段二：L-BFGS 精修（固定权重为退火终值） ----------------------- #
     lbfgs = torch.optim.LBFGS(
@@ -296,16 +340,16 @@ def solve(
         holder["terms"] = terms
         return terms.total
 
-    converged = True
+    failed = False
     try:
         lbfgs.step(closure)  # type: ignore[arg-type]
     except RuntimeError as e:          # 线搜索失败等
-        converged = False
+        failed = True
         notes.append(f"L-BFGS 提前结束（{e}）；已保留 Adam 阶段结果")
 
     var.clamp_(max_rot, cfg.max_translation_m)
     if "terms" in holder:
-        record(cfg.adam_iters, holder["terms"], "lbfgs")  # type: ignore[arg-type]
+        record(adam_used, holder["terms"], "lbfgs")  # type: ignore[arg-type]
 
     pose = var().detach()
     with torch.no_grad():
@@ -313,12 +357,21 @@ def solve(
 
     # 健康检查：ROM 越界是硬性物理错误，必须显式告警
     if final.get("rom", 0.0) > 1.0:
-        converged = False
+        failed = True
         notes.append(f"最终解存在 ROM 越界（rom={final['rom']:.2f}），"
                      f"建议调低参数激进程度或提高 w_rom")
+
+    # 真正的收敛判据：连二阶方法都再推不动任务项，才算到了驻点
+    lbfgs_gain = (pre_lbfgs - final.get("task", pre_lbfgs)) / max(abs(pre_lbfgs), 1e-12)
+    converged = (not failed) and lbfgs_gain < cfg.converge_tol
+    if not converged and not failed:
+        notes.append(
+            f"未收敛：L-BFGS 又把任务项降了 {lbfgs_gain * 100:.1f}%"
+            f"（{pre_lbfgs:.1f} -> {final.get('task', 0):.1f}），说明解还没到驻点；"
+            f"结果仍可用，但跨轮比较会混入优化器差异，建议加大 adam_iters")
 
     notes.append(f"增量幅度 {var.stats()}")
     return SolveResult(
         pose=pose, history=history, initial_terms=initial, final_terms=final,
         weights=loss_fn.w, elapsed_s=time.time() - t_start,
-        converged=converged, notes=notes)
+        converged=converged, failed=failed, adam_used=adam_used, notes=notes)
