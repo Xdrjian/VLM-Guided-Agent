@@ -33,6 +33,7 @@ sys.path.insert(0, str(ROOT))
 
 import torch  # noqa: E402
 
+from motionedit.collision import fit_capsules                  # noqa: E402
 from motionedit.features import extract_features              # noqa: E402
 from motionedit.motion_io import MotionSequence, load_motion, save_motion  # noqa: E402
 from motionedit.params import GaitParams                      # noqa: E402
@@ -103,9 +104,12 @@ def main() -> int:
     banner("4. 求解")
     grip = calibrate_grip(seq, skel, tray_name=TRAY)
     print(f"  抓握标定 {json.dumps(grip.summary(), ensure_ascii=False)}")
+    capsules = fit_capsules(args.skeleton, skel)
+    print(f"  胶囊体 {capsules.count} 个（由蒙皮权重自动拟合）")
     res = solve(seq, skel, target, cfg=SolverConfig(
         adam_iters=args.adam_iters, lbfgs_iters=args.lbfgs_iters,
-        device=args.device, log_every=max(args.adam_iters // 6, 1)), grip=grip)
+        device=args.device, log_every=max(args.adam_iters // 6, 1)),
+        grip=grip, capsules=capsules)
     print(json.dumps(res.summary(), ensure_ascii=False, indent=2))
 
     banner("5. 结果对比（参考 → 目标 → 实际）")
