@@ -57,6 +57,7 @@ from .features import joint_angle_3pt, trunk_lean_angle, pelvis_axes, hip_flex_a
 from .phase import ContactConfig
 from .rom import ROMPenalty
 from .rotation import quaternion_geodesic_sq
+from .collision import CapsuleSet, CollisionPenalty, build_collision_penalty
 from .skeleton import Skeleton
 from .targets import TargetSpec
 from .tray import GripCalibration, tray_frames_from_hands, tray_normal_from_frames
@@ -141,6 +142,13 @@ class LossWeights:
     #: 只罚"比参考动作做得更差"，不要求做到绝对水平（A_ref 自身就有 3.31°）
     level_margin_deg: float = 0.5
 
+    #: 肢间穿插。ROM 是**局部**约束，撑不住**全局**无碰撞：
+    #: exp07 round 4 里每个关节都在 ROM 内（rom=0.004），双膝间距却从 14.1cm 塌到 1.1cm。
+    w_collision: float = 1.0
+    #: 允许比参考动作多侵入多少（米）。端托盘时前臂就悬在大腿上方，
+    #: 手臂-大腿各对全程天然就紧，余量太小会在恒等参数下就产生伪压力。
+    collision_slack_m: float = 0.03
+
     #: contact 项内部三个分量的相对配比：穿地 / 防滑 / 锚定
     contact_penetration: float = 1.0
     contact_slip: float = 1.0
@@ -171,6 +179,7 @@ class LossTerms:
     contact: Tensor
     grip: Tensor
     level: Tensor
+    collision: Tensor
     task_parts: Dict[str, Tensor] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, float]:
@@ -179,6 +188,7 @@ class LossTerms:
             "total": f(self.total), "task": f(self.task),
             "prior": f(self.prior), "rom": f(self.rom), "smooth": f(self.smooth),
             "contact": f(self.contact), "grip": f(self.grip), "level": f(self.level),
+            "collision": f(self.collision),
         }
         d.update({f"task.{k}": f(v) for k, v in self.task_parts.items()})
         return d
@@ -206,6 +216,7 @@ class MotionLoss:
         fps: float = 24.0,
         contact_cfg: Optional[ContactConfig] = None,
         grip: Optional[GripCalibration] = None,
+        capsules: Optional[CapsuleSet] = None,
     ) -> None:
         self.skel = skel
         self.ref_pose = ref_pose.detach()
@@ -229,7 +240,8 @@ class MotionLoss:
         with torch.no_grad():
             self.foot_idx = torch.tensor(
                 [skel.index(b) for b in self.foot_bones], device=ref_pose.device)
-            ref_joints = skel.joint_positions(self.ref_pose)
+            ref_world = skel.forward_kinematics(self.ref_pose)
+            ref_joints = ref_world[..., :3, 3]
             self.ref_foot = ref_joints[:, self.foot_idx]                # [T,4,3]
             # 地面高度取参考动作中足部的最低点（数据未必恰好以 z=0 为地面）
             self.ground_z = float(self.ref_foot[..., _UP].min())
@@ -250,6 +262,13 @@ class MotionLoss:
             shift = shift.clone()
             shift[:, _UP] = 0.0                                      # 只平移水平分量
             self.ref_foot = self.ref_foot + self._hold_per_stance(shift, self.contact_mask)
+
+            # 肢间间隙以**参考动作**标定，保证参考动作上惩罚恒为 0，
+            # 也就不需要手写“允许碰撞表”。必须用 anchor 而非原始 A_ref：
+            # prior / contact 都以 anchor 为准，三者口径不一致会互相对抗。
+            self.collision = (None if capsules is None else build_collision_penalty(
+                capsules.to(ref_pose.device), skel, ref_world,
+                slack_m=self.w.collision_slack_m))
 
     @staticmethod
     def _hold_per_stance(shift: Tensor, mask: Tensor) -> Tensor:
@@ -395,12 +414,16 @@ class MotionLoss:
         smooth = self._smooth(pose)
         contact = self._contact(pose, world)
 
+        collision = (pose.new_zeros(()) if self.collision is None
+                     else self.collision(world))
+
         total = (task + w.w_prior * prior + w.w_rom * rom
                  + w.w_smooth * smooth + w.w_contact * contact
-                 + w.w_grip * grip + w.w_level * level)
+                 + w.w_grip * grip + w.w_level * level
+                 + w.w_collision * collision)
         return LossTerms(total=total, task=task, prior=prior, rom=rom,
                          smooth=smooth, contact=contact, grip=grip, level=level,
-                         task_parts=parts)
+                         collision=collision, task_parts=parts)
 
     # ------------------------------------------------------------------ #
     def calibrate(self, pose: Tensor, ratios: Optional[Dict[str, float]] = None) -> LossWeights:
