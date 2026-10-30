@@ -29,6 +29,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
+from .collision import fit_capsules
 from .features import GaitFeatures, extract_features
 from .motion_io import MotionSequence, load_motion, save_motion
 from .outer_loop import SolveOutput
@@ -55,6 +56,10 @@ class ExecCheckConfig:
     grip_tol: float = 5.0
     #: 托盘倾角 hinge 上限（度²）
     level_tol: float = 25.0
+    #: 肢间穿插上限。**与 ROM 同级的物理有效性判据**：exp07 round 4 的双膝
+    #: 穿模在旧审计下全部“合格”，因为没有任何一项在看全局碰撞。
+    #: 参考动作上恒为 0，故任何正值都是“比参考更挤”。
+    collision_tol: float = 1.0
     #: 欠收敛是否要记一笔。它不计为失效，但各轮收敛程度不一致会让
     #: VLM 看到的差异里混入优化器运气，是个必须可追溯的混淆变量。
     require_converged: bool = True
@@ -156,6 +161,8 @@ class MotionSolveFn:
         self.grip: Optional[GripCalibration] = None
         if tray_name in self.seq.objects:
             self.grip = calibrate_grip(self.seq, self.skel, tray_name)
+        # 胶囊体只与静止骨架有关，拟合一次跨轮复用
+        self.capsules = fit_capsules(skeleton_path, self.skel)
         self._consecutive_failures = 0
 
     # ------------------------------------------------------------------ #
@@ -165,7 +172,8 @@ class MotionSolveFn:
         p = params.clipped()
 
         target = build_targets(self.curves, p, self.ref_features.tray_chest_distance_mean)
-        res = solve(self.seq, self.skel, target, cfg=self.solver_cfg, grip=self.grip)
+        res = solve(self.seq, self.skel, target, cfg=self.solver_cfg,
+                    grip=self.grip, capsules=self.capsules)
 
         out = MotionSequence(
             pose=res.pose.detach().cpu(), bone_names=self.seq.bone_names,
@@ -241,7 +249,8 @@ class MotionSolveFn:
             notes.append("求解器未达驻点（仅提示，不计为失效）")
         for key, tol, label in (("rom", cfg.rom_tol, "ROM 越界"),
                                 ("grip", cfg.grip_tol, "抓握脱手"),
-                                ("level", cfg.level_tol, "托盘倾倒")):
+                                ("level", cfg.level_tol, "托盘倾倒"),
+                                ("collision", cfg.collision_tol, "肢体自穿插")):
             val = float(terms.get(key, 0.0))
             if val > tol:
                 violations.append(f"{label}：{key}={val:.4f} > {tol}")
