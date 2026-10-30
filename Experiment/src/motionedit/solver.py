@@ -37,6 +37,7 @@ import torch
 from torch import Tensor
 
 from .losses import LossWeights, MotionLoss
+from .collision import CapsuleSet
 from .motion_io import MotionSequence
 from .phase import ContactConfig
 from .rom import ROMPenalty, build_rom_penalty
@@ -128,6 +129,7 @@ class SolveResult:
             "contact": f"{i.get('contact', 0):.2e} -> {f.get('contact', 0):.2e}",
             "grip": f"{i.get('grip', 0):.4f} -> {f.get('grip', 0):.4f}",
             "level": f"{i.get('level', 0):.4f} -> {f.get('level', 0):.4f}",
+            "collision": f"{i.get('collision', 0):.4f} -> {f.get('collision', 0):.4f}",
             "notes": self.notes,
         }
 
@@ -203,6 +205,7 @@ def solve(
     rom: Optional[ROMPenalty] = None,
     callback: Optional[Callable[[int, Dict[str, float]], None]] = None,
     grip: Optional[GripCalibration] = None,
+    capsules: Optional[CapsuleSet] = None,
 ) -> SolveResult:
     """对一段参考动作求解满足 ``target`` 的新动作。
 
@@ -245,6 +248,8 @@ def solve(
     rom = (rom or build_rom_penalty(skel)).to(dev)
     if grip is not None:
         grip = grip.to(dev)
+    if capsules is not None:
+        capsules = capsules.to(dev)
 
     # 暖启动：先把参考动作按时间映射整体拉伸/压缩到新时间轴，
     # 剩下的残差才交给优化器。同时用它作为姿势先验的锚点——否则先验会要求
@@ -258,7 +263,8 @@ def solve(
 
     var = PoseVariable(anchor, skel.dof_mask().to(dev), skel.index("mixamorig:Hips")).to(dev)
     loss_fn = MotionLoss(skel, anchor, target, rom, weights,
-                         fps=seq.fps, contact_cfg=cfg.contact_cfg, grip=grip)
+                         fps=seq.fps, contact_cfg=cfg.contact_cfg, grip=grip,
+                         capsules=capsules)
 
     # 初始点自动定标（仅当调用方未显式给权重时）
     if weights is None:
@@ -360,6 +366,14 @@ def solve(
         failed = True
         notes.append(f"最终解存在 ROM 越界（rom={final['rom']:.2f}），"
                      f"建议调低参数激进程度或提高 w_rom")
+
+    # 碰撞残余要点名到具体哪一对，否则只看到一个数字无从下手
+    if final.get("collision", 0.0) > 1e-6 and loss_fn.collision is not None:
+        with torch.no_grad():
+            worst = loss_fn.collision.worst(skel.forward_kinematics(pose))
+        if worst:
+            notes.append("肢间穿插残余：" + "；".join(
+                f"{w['pair']} 超出 {w['deficit_cm']}cm" for w in worst[:4]))
 
     # 真正的收敛判据：连二阶方法都再推不动任务项，才算到了驻点
     lbfgs_gain = (pre_lbfgs - final.get("task", pre_lbfgs)) / max(abs(pre_lbfgs), 1e-12)
