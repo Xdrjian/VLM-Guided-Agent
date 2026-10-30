@@ -44,6 +44,8 @@ from motionedit.rotation import (                                     # noqa: E4
     quaternion_to_matrix,
 )
 from motionedit.skeleton import CORE_BONES, Skeleton                  # noqa: E402
+from motionedit.collision import (build_collision_penalty, fit_capsules,  # noqa: E402
+                                  segment_distance)
 from motionedit.solver import PoseVariable, SolverConfig, solve       # noqa: E402
 from motionedit.targets import (build_targets, resample, resample_objects,      # noqa: E402
                                 resample_pose)
@@ -280,6 +282,62 @@ def test_tray(seq, skel: Skeleton):
           f"标准差 {float(sep.std()) * 1000:.2f} mm")
 
 
+def test_collision(seq, skel: Skeleton):
+    print("\n[6b] 身体级碰撞约束")
+
+    # --- 线段距离的闭式解 --- #
+    z = torch.zeros(3)
+    p1 = torch.tensor([[0.0, 0.0, 0.0]])
+    q1 = torch.tensor([[1.0, 0.0, 0.0]])
+    p2 = torch.tensor([[0.0, 0.5, 0.0]])
+    q2 = torch.tensor([[1.0, 0.5, 0.0]])
+    check("平行线段距离正确", abs(float(segment_distance(p1, q1, p2, q2)) - 0.5) < 1e-5)
+    check("相交线段距离为 0",
+          float(segment_distance(p1, q1, torch.tensor([[0.5, -1.0, 0.0]]),
+                                 torch.tensor([[0.5, 1.0, 0.0]]))) < 1e-5)
+    check("错开线段取端点距离",
+          abs(float(segment_distance(p1, q1, torch.tensor([[3.0, 0.0, 0.0]]),
+                                     torch.tensor([[4.0, 0.0, 0.0]]))) - 2.0) < 1e-5)
+    check("退化为点时不除零",
+          torch.isfinite(segment_distance(p1, p1, p2, p2)).all())
+
+    # --- 从蒙皮权重自动拟合 --- #
+    caps = fit_capsules(SKEL_JSON, skel)
+    check("拟合出全部核心骨骼的胶囊", caps.count >= 20, str(caps.count))
+    by_name = {r["name"]: r for r in caps.summary()}
+    # 半径须符合解剖学量级，拟歪了后面全是错的
+    thigh = by_name["mixamorig:LeftUpLeg"]["radius_cm"]
+    forearm = by_name["mixamorig:LeftForeArm"]["radius_cm"]
+    check("大腿半径在 6~13cm", 6 < thigh < 13, f"{thigh}cm")
+    check("前臂半径在 2~6cm", 2 < forearm < 6, f"{forearm}cm")
+    check("大腿比前臂粗", thigh > forearm, f"{thigh} vs {forearm}")
+
+    # --- 间隙自标定：参考动作上必须恒为 0 --- #
+    world = skel.forward_kinematics(seq.pose)
+    pen = build_collision_penalty(caps, skel, world)
+    check("排除父子对后仍有足够检测对", pen.num_pairs > 100, str(pen.num_pairs))
+    check("参考动作上惩罚恒为 0（自标定的定义性质）",
+          float(pen(world)) < 1e-9, f"{float(pen(world)):.3e}")
+    check("参考动作上无违规对", not pen.worst(world), str(pen.worst(world)[:2]))
+
+    # 左右小腿必须在检测对里——exp07 塌掉的正是这一对
+    li, ri = caps.names.index("mixamorig:LeftLeg"), caps.names.index("mixamorig:RightLeg")
+    hit = ((pen.pair_i == li) & (pen.pair_j == ri)) | ((pen.pair_i == ri) & (pen.pair_j == li))
+    check("左右小腿在检测对中", bool(hit.any()))
+
+    # --- 人为把双腿并拢，惩罚必须被触发 --- #
+    moved = world.clone()
+    lat = world[:, skel.index("mixamorig:RightUpLeg"), :3, 3] - \
+        world[:, skel.index("mixamorig:LeftUpLeg"), :3, 3]
+    for bone in ("mixamorig:LeftLeg", "mixamorig:LeftFoot", "mixamorig:LeftToeBase"):
+        moved[:, skel.index(bone), :3, 3] += lat * 0.5
+    for bone in ("mixamorig:RightLeg", "mixamorig:RightFoot", "mixamorig:RightToeBase"):
+        moved[:, skel.index(bone), :3, 3] -= lat * 0.5
+    check("双腿并拢时惩罚被触发", float(pen(moved)) > 1.0, f"{float(pen(moved)):.1f}")
+    check("能点名是哪一对越界", bool(pen.worst(moved)), str(pen.worst(moved)[:2]))
+    return caps
+
+
 def test_params():
     print("\n[7] params")
     p = GaitParams()
@@ -356,7 +414,7 @@ def test_targets(feats, curves):
     check("极端双支撑偏置仍保持单调", bool((d2 > 0).all()))
 
 
-def test_solver(seq, skel: Skeleton, feats, curves):
+def test_solver(seq, skel: Skeleton, feats, curves, caps=None):
     print("\n[9] 求解器")
     ref_d = feats.tray_chest_distance_mean
 
@@ -448,7 +506,7 @@ def test_solver(seq, skel: Skeleton, feats, curves):
     # 求解器用肩关节 24.6° 的旋转去抹平，把双手从 0.579m 挤到 0.31m。
     grip_ref = calibrate_grip(seq, skel, "draw_organizer_tray")
     t_id = build_targets(curves, GaitParams(), ref_d)
-    res_id = solve(seq, skel, t_id, grip=grip_ref,
+    res_id = solve(seq, skel, t_id, grip=grip_ref, capsules=caps,
                    cfg=SolverConfig(adam_iters=120, lbfgs_iters=20, log_every=999))
     check("恒等参数下任务项本就接近 0", res_id.initial_terms["task"] < 1.0,
           f"初始 task={res_id.initial_terms['task']:.3f}")
@@ -466,6 +524,10 @@ def test_solver(seq, skel: Skeleton, feats, curves):
           f"grip={res_id.final_terms['grip']:.4f}")
     check("恒等参数下托盘不倾倒", res_id.final_terms["level"] < 1.0,
           f"level={res_id.final_terms['level']:.4f}")
+    # 间隙是按 A_ref 标定的，恒等参数下必须不被触发；否则说明标定口径与
+    # 求解用的 anchor 对不上，会凭空给出伪压力
+    check("恒等参数下无肢间穿插", res_id.final_terms.get("collision", 0.0) < 1e-6,
+          f"collision={res_id.final_terms.get('collision', 0.0):.3e}")
 
     q_a, q_b = seq.pose[:, :, :4], res_id.pose.cpu()[:, :, :4]
     dev_deg = 2 * torch.rad2deg(torch.acos((q_a * q_b).sum(-1).abs().clamp(max=1.0)))
@@ -519,9 +581,10 @@ def main() -> int:
     feats, curves = test_features(seq, skel)
     test_rom(seq, skel)
     test_tray(seq, skel)
+    caps = test_collision(seq, skel)
     test_params()
     test_targets(feats, curves)
-    test_solver(seq, skel, feats, curves)
+    test_solver(seq, skel, feats, curves, caps)
 
     print("\n" + "=" * 70)
     print(f"结果: {len(PASS)} passed, {len(FAIL)} failed")
